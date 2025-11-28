@@ -9,28 +9,39 @@
 # Description：
 
 """
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict
 
 @dataclass
 class Detection:
-    id: int
     cls: int
     x: float  # x_center (pixel)
     y: float  # y_center (pixel)
     w: float  # width (pixel)
     h: float  # height (pixel)
-    conf: float
-    status: str = "active"  # active, processing, deleted
+    conf: float  # 2.0 -> externally added
+    status: str = "active"  # active, filtered
+
+    def __eq__(self, other):
+        """重写相等性判断。当且仅当 self 和 other 对象的 x 和 y 坐标相等时，返回 True。"""
+        if not isinstance(other, Detection):
+            return NotImplemented
+
+        epsilon = 1e-6  # 定义一个很小的容忍度
+        # 检查 x 和 y 是否在容忍度范围内相等
+        x_equal = math.isclose(self.x, other.x, abs_tol=epsilon)
+        y_equal = math.isclose(self.y, other.y, abs_tol=epsilon)
+        return x_equal and y_equal
 
 
 @dataclass
 class Tile:
     name: str  # tile_file.name
-    tile_id: int
+    tile_sec: int
     tile_file: Path
-    status: str = "processed"  # processed, deleted
+    status: str = "processed"  # processed, deleted, processing
     detections: List[Detection] = field(default_factory=list)
 
 
@@ -41,7 +52,7 @@ class Montage:
     map_file: Path
     map_frames: List[int]
     status: str = "not generated"  # not generated, not processed, processing, processed, error
-    tiles: Dict[int, Tile] = field(default_factory=dict)  # slice in this montage = tile_id -> tile
+    tiles: Dict[str, Tile] = field(default_factory=dict)  # slice in this montage = tile_name -> tile
 
 
 STATUS_COLORS = {

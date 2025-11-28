@@ -15,7 +15,7 @@ Main components:
  - SettingsPanel: set project paths and parameters; export predictions to existing nav file
  - StatusPanel: lists montages and per-montage statuses, starts processing
  - ViewerPanel: display selected montage/tile with predicted boxes; edit boxes
- - Background workers: splitting + prediction pipeline; filesystem watcher
+ - Background workers: splitting + prediction + finding-center + deduplication pipeline; filesystem watcher
 """
 from __future__ import annotations
 import sys
@@ -37,7 +37,7 @@ from ultralytics import YOLO
 from src.utils.data_models import Montage, Tile, Detection, STATUS_COLORS
 from src.utils.pp_io import load_nav_and_montages, ensure_project_dirs, write_detections, read_detections, \
     add_predictions_to_nav, TILE_NAME_TEMPLATE, PRED_NAME_TEMPLATE, append_to_manual_list, read_manual_list, match_name, \
-    _TILE_RE, remove_from_manual_list
+    _TILE_RE, remove_from_manual_list, _PRED_RE, read_mdoc_spacing
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -87,7 +87,7 @@ class MontageWatcher(FileSystemEventHandler):
         if mont.status == "not generated":
             mont.status = "queuing"
             mont.map_file = file_path
-            self.ui_queue.put(("update_montage", mont))
+            self.ui_queue.put(("update_montage_status", (mont, None)))
             self.job_queue.put(mont)
             self.processed_files.add(file_path.resolve())
         elif mont.status == "processed":
@@ -118,11 +118,11 @@ class YoLoWrapper:
 
     def __init__(self, model_path: str):
         self.model = YOLO(model_path)
-        self._total_id = 0
 
-    def predict_image(self, img_path: str, cfg: dict) -> Optional[List[Detection]]:
+    def predict_image(self, img_path: str, cfg: dict) -> Tuple[Optional[List[Detection]], float, float, float]:
         # cfg keys expected: model_path, img_size, box_size, max_detection, conf, iou, device (either 'cpu' or [GPU index list])
         dets: List[Detection] = []
+        s_pre, s_i, s_post = 0.0, 0.0, 0.0
         try:
             results = self.model.predict(source=img_path, conf=cfg["conf"], iou=cfg["iou"], imgsz=cfg["img_size"],
                                          device=cfg["device"], max_det=cfg["max_detection"], save_conf=True, verbose=False)
@@ -133,19 +133,14 @@ class YoLoWrapper:
                     cls = int(b.cls[0].cpu().numpy())
                     x, y, w, h = xywh
                     w, h = float(cfg["box_size"]), float(cfg["box_size"])
-                    self._total_id += 1
-                    dets.append(Detection(self._total_id, cls, x, y, w, h, conf, "active"))
-
-                total_num = len(dets)
-                s_pre = round(r.speed['preprocess'], 1)
-                s_i = round(r.speed['inference'], 1)
-                s_post= round(r.speed['postprocess'], 1)
-                logger.info(f"Predicted {total_num} targets: "
-                            f"{s_pre}ms preprocess, {s_i}ms inference, {s_post}ms postprocess for {img_path}")
+                    dets.append(Detection(cls, x, y, w, h, conf, "active"))
+                s_pre = round(r.speed['preprocess'] / 1000, 2)
+                s_i = round(r.speed['inference'] / 1000, 2)
+                s_post= round(r.speed['postprocess'] / 1000, 2)
         except Exception as e:
             logger.error(f"Inference error on {img_path}: {e}")
 
-        return dets
+        return dets, s_pre, s_i, s_post
 
 
 # -----------------------------
@@ -181,15 +176,16 @@ class MontageProcessor(QtCore.QThread):
                 self._process_single_montage(montage, images_dir, preds_dir)
             except Exception as e:
                 montage.status = "error"
-                self.ui_queue.put(("update_montage", montage))
-                logger.error(f"Processing failed for {montage.name}: {e}")
+                msg = f"Processing failed for {montage.name}: {e}"
+                logger.error(msg)
+                self.ui_queue.put(("update_montage_status", (montage, msg)))
             finally:
                 self.job_queue.task_done()
 
     def _process_single_montage(self, montage: Montage, images_dir: Path, preds_dir: Path):
-        """Handle splitting, prediction, and feature logic for one montage."""
+        """Handle splitting, prediction, finding center, deduplication for one montage."""
         montage.status = "processing"
-        self.ui_queue.put(("update_montage", montage))
+        self.ui_queue.put(("update_montage_status", (montage, None)))
 
         nx, ny = montage.map_frames
         try:
@@ -206,34 +202,42 @@ class MontageProcessor(QtCore.QThread):
                     pred_path = preds_dir / pred_name
 
                     # 2. Save Image (Normalized)
+                    splitting_time = time.time()
                     img_data = mrc.data[z].astype(np.uint16).astype(np.float16)  # To avoid transforming to float64 to compute img_norm
                     img_norm = ((img_data - img_data.min()) / (img_data.max() - img_data.min()) * 255).astype(np.uint8)  # Ultralytics only accept int8 images to be processed
                     if not tile_path.exists() or self.cfg.get('overwrite', False):  # write png if not existing or overwrite
                         cv2.imwrite(str(tile_path), img_norm)
-                    tile = Tile(name=tile_name, tile_id=z, tile_file=tile_path)
+                    tile = Tile(name=tile_name, tile_sec=z, tile_file=tile_path)
+                    splitting_time = time.time() - splitting_time
 
                     # 3. Prediction & Find center
                     if not pred_path.exists() or self.cfg.get('overwrite', False):
                         # A. Run YOLO
-                        dets = self.predictor.predict_image(str(tile_path), self.cfg)
-                        # B. Find Center Point
-                        start = time.time()
-                        center_det = self._find_center_point(img_norm, dets)
+                        dets, s_pre, s_infer, s_post = self.predictor.predict_image(str(tile_path), self.cfg)
 
+                        # B. Find Center Point
+                        centering_time = time.time()
+                        center_det = self._find_center_point(img_norm, dets)
                         if center_det:  # Add to front of list
                             dets.insert(0, center_det)
                         else:  # Not found: Signal UI to add to manual list
                             append_to_manual_list(self.project_root, tile_name)
                             self.ui_queue.put(("add_manual_item", tile_name))
-                        period = time.time() - start
-                        logger.info(f"_find_center_points takes {period} seconds.")
 
+                        centering_time = time.time() - centering_time
                         write_detections(pred_path, dets)
+                    montage.tiles[tile_name] = tile
+                    msg = (f"For {tile_name}: picked {len(dets)} points, {round(s_pre + splitting_time, 2)}s preprocess, "
+                           f"{s_infer}s inference, {round(s_post + centering_time, 2)}s postprocess.")
+                    logger.info(msg)
+                    self.ui_queue.put(("add_tile_item", (montage, msg)))
 
-                    montage.tiles[z] = tile
-                    self.ui_queue.put(("refresh_tile_list", montage.name))
+            # 4. Deduplication Logic
+            removed_num = self._deduplicate_montage(montage, preds_dir)
             montage.status = "processed"
-            self.ui_queue.put(("update_montage", montage))
+            msg = f"For {montage.name}: removed {removed_num} points for collision."
+            logger.info(msg)
+            self.ui_queue.put(("update_montage_status", (montage, msg)))
         except Exception as e:
             logger.error(f"Error reading MRC {montage.map_file}: {e}")
             raise e
@@ -245,15 +249,12 @@ class MontageProcessor(QtCore.QThread):
         """
         h, w = img.shape
         box_size = int(self.cfg["box_size"])
-        half_box = box_size // 2
-
-        # Define Center 1/16th area (1/4 width * 1/4 height centered)
-        # Range x: [3w/8, 5w/8], Range y: [3h/8, 5h/8]
-        x_start, x_end = int(3 * w / 8), int(5 * w / 8)
-        y_start, y_end = int(3 * h / 8), int(5 * h / 8)
+        # Define Center 1/4th area (1/2 width * 1/2 height centered)
+        x_start, x_end = int(1 * w / 4), int(3 * w / 4)
+        y_start, y_end = int(1 * h / 4), int(3 * h / 4)
 
         # Heuristic: Search this area with a stride
-        stride = max(10, box_size // 4)
+        stride = max(32, box_size // 4)
         candidates = []
 
         global_mean = np.mean(img)
@@ -261,41 +262,116 @@ class MontageProcessor(QtCore.QThread):
             for x in range(x_start, x_end - box_size, stride):
                 # Crop the potential box area
                 roi = img[y: y + box_size, x: x + box_size]
-
                 # Check 1: Pixel value extremes (Ice vs Vacuum)
                 # "Not too close to 0 (ice), not too close to 255 (vacuum)"
-                if np.min(roi) < 20 or np.max(roi) > 230:
+                if np.min(roi) < 10 or np.max(roi) > 245:
                     continue
-
                 mean_val = np.mean(roi)
                 # Check 2: Darker than surroundings (Carbon is darker than ice/vacuum usually in normalized)
-                if mean_val >= global_mean * 0.95:
+                if mean_val > global_mean * 0.75:
                     continue
-
-                # Check 3: Overlap with existing YOLO boxes
-                cx, cy = x + half_box, y + half_box
-                if self._check_overlap(cx, cy, box_size, existing_dets):
+                # Check 3: Overlap with existing YOLO boxes  光束直径1.6um，约4个box
+                cx, cy = x + box_size * 2, y + box_size * 2
+                if self._check_overlap(cx, cy, box_size * 4, existing_dets):
                     continue
-
                 candidates.append((mean_val, cx, cy))
-
         if not candidates:
             return None
 
-        # pick the one closest to absolute center of image to be safe
-        img_cx, img_cy = w / 2, h / 2
-        candidates.sort(key=lambda c: (c[1] - img_cx) ** 2 + (c[2] - img_cy) ** 2)
+        candidates.sort(key=lambda c: c[0])
         best = candidates[0]
-        return Detection(
-            id=0, cls=0,
-            x=best[1], y=best[2], w=float(box_size), h=float(box_size),
-            conf=2.0, status="active")  # conf 2.0 indicates generated point
+        return Detection(cls=0, x=best[1], y=best[2], w=float(box_size), h=float(box_size), conf=2.0, status="active")  # conf 2.0 indicates generated point
+
+    def _deduplicate_montage(self, montage: Montage, preds_dir: Path) -> int:
+        """
+        Detects and removes duplicate detections in overlapping regions between tiles.
+        1. Reads PieceSpacing from .mdoc file.
+        2. Maps all detections to global montage coordinates based on Y-first then X layout.
+        3. Checks for collisions
+        4. Keeps high confidence.
+        Returns the number of removed detections.
+        """
+        # 1. Get PieceSpacing
+        nav_folder = self.cfg["nav_path"].parent
+        mdoc_path = nav_folder / f"{montage.map_file.name}.mdoc"
+        spacing_x, spacing_y = read_mdoc_spacing(mdoc_path)
+        if spacing_x == 0 or spacing_y == 0:
+            logger.error(f"Could not read valid PieceSpacing from {mdoc_path}. Skipping deduplication.")
+            return 0
+
+        nx, ny = montage.map_frames  # nx=columns, ny=rows
+        box_size = self.cfg["box_size"]
+
+        # 2. Load all detections for this montage into memory
+        all_points = []  # list of {'global_x', 'global_y', 'conf', 'tile_z', 'local_idx', 'det_obj'}
+        tile_dets_map = {}  # z -> list of Detections
+        for z in range(nx * ny):
+            pred_name = PRED_NAME_TEMPLATE.format(montage=montage.map_file.stem, z=z)
+            p_path = preds_dir / pred_name
+            dets = read_detections(p_path)
+            tile_dets_map[z] = dets
+
+            # First along Y axis (row changes fastest), then along X axis (col changes slowest).
+            # z=0 -> row=0, col=0
+            # z=1 -> row=1, col=0 (Y increases)
+            # ...
+            # z=ny -> row=0, col=1 (X increases, Y resets)
+            col = z // ny  # X index
+            row = z % ny  # Y index
+            offset_x = col * spacing_x
+            offset_y = row * spacing_y
+
+            for i, d in enumerate(dets):
+                gx = offset_x + d.x
+                gy = offset_y + d.y
+                all_points.append({'gx': gx, 'gy': gy, 'conf': d.conf, 'z': z, 'local_idx': i, 'det': d})
+
+        # 3. Detect Collisions
+        removals = set()  # Set of (z, local_idx) to remove
+        for i in range(len(all_points)):
+            p1 = all_points[i]
+            # If p1 is already marked for removal, it shouldn't suppress others
+            if (p1['z'], p1['local_idx']) in removals:
+                continue
+            for j in range(i + 1, len(all_points)):
+                p2 = all_points[j]
+                # If p2 is already removed, skip it
+                if (p2['z'], p2['local_idx']) in removals:
+                    continue
+
+                tmp_det = [Detection(cls=0, x=p2['gx'], y=p2['gy'], w=box_size, h=box_size, conf=p2['conf'], status="active")]
+                if self._check_overlap(p1['gx'], p1['gy'], box_size, tmp_det):
+                    if p1['conf'] < p2['conf']:
+                        removals.add((p1['z'], p1['local_idx']))
+                        # Since p1 is now removed, it cannot eliminate any further p3, so we break p1's loop
+                        break
+                    else:
+                        # p2 is removed, but p1 should still compare with others
+                        removals.add((p2['z'], p2['local_idx']))
+
+        # 4. Apply Removals
+        if removals:
+            for (z, idx) in removals:
+                tile_dets_map[z][idx].status = "deleted"
+
+            for z in range(nx * ny):
+                pred_name = PRED_NAME_TEMPLATE.format(montage=montage.map_file.stem, z=z)
+                p_path = preds_dir / pred_name
+
+                # Filter out deleted ones
+                valid_dets = [d for d in tile_dets_map[z] if d.status != "deleted"]
+                write_detections(p_path, valid_dets)
+
+                # Update memory in montage object
+                tile_name = TILE_NAME_TEMPLATE.format(montage=montage.map_file.stem, z=z)
+                montage.tiles[tile_name].detections = valid_dets
+
+        return len(removals)
 
     @staticmethod
     def _check_overlap(cx, cy, size, dets) -> bool:
-        """Simple box overlap check."""
-        r1_x1, r1_y1 = cx - size / 2, cy - size / 2
-        r1_x2, r1_y2 = cx + size / 2, cy + size / 2
+        r1_x1, r1_y1 = cx - size / 2, cy - size / 2  # 左上角
+        r1_x2, r1_y2 = cx + size / 2, cy + size / 2  # 右下角
 
         for d in dets:
             r2_x1, r2_y1 = d.x - d.w / 2, d.y - d.h / 2
@@ -325,7 +401,6 @@ class SettingsPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self.gpus = self._detect_gpu()                  # 仅需初始运行一次
         self._build_ui()
-        # self._connect_change_signals()                # 连接控件变化到 settings_changed
 
     @staticmethod
     def _detect_gpu() -> List[Dict]:
@@ -378,8 +453,8 @@ class SettingsPanel(QtWidgets.QWidget):
 
         # Nav line with Browse
         self.nav_path = QtWidgets.QLineEdit()            # 导航文件路径文本输入框
-        default_nav = self.get_resource_path("test/nav001.nav")         # for test
-        self.nav_path.setText(str(default_nav))
+        # default_nav = self.get_resource_path("test/nav001.nav")         # for test
+        # self.nav_path.setText(str(default_nav))
         self.nav_path_btn = QtWidgets.QPushButton("Browse")
 
         nav_h = QtWidgets.QHBoxLayout()
@@ -534,6 +609,7 @@ class StatusPanel(QtWidgets.QWidget):
         self.table_widget.setHorizontalHeaderLabels(["Montage Name", "Status"])         # 设置列标题
         # 设置表格属性
         self.table_widget.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)  # 第一列拉伸
+        self.table_widget.setColumnWidth(1, 160)
         self.table_widget.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)  # 整行选择
         self.table_widget.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)   # 不可编辑
         self.table_widget.itemSelectionChanged.connect(self.on_selection_changed)
@@ -546,8 +622,9 @@ class StatusPanel(QtWidgets.QWidget):
             name = selected_items[0].text()                                 # 第一列是名称
             self.montage_selected.emit(name)
 
-    def refresh(self):
+    def refresh(self,montages: Dict[str, Montage]):
         """刷新表格显示"""
+        self.montages = montages
         self.table_widget.setRowCount(0)                                    # 清空所有行
         for m in self.montages.values():
             self.update_montage(m)
@@ -575,58 +652,58 @@ class StatusPanel(QtWidgets.QWidget):
 class ViewerPanel(QtWidgets.QWidget):
     """Main interactive area: 3-column layout: Tile List | Canvas | Confirmation List"""
 
-    tile_selected = QtCore.pyqtSignal(str)      # 选择Manual Confirmation List某行时发射tile name
+    tile_selected = QtCore.pyqtSignal(str)      # 选择Manual Confirmation List某行时发射mont_stem
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.current_montage: Optional[Montage] = None
-        self.current_tile_id: Optional[int] = None              # 只知道id，不知道归属于哪个montage
+        self.current_tile_name: Optional[str] = None
         self.selected_det: Optional[Detection] = None
 
         self.images_dir: Optional[Path] = None
         self.preds_dir: Optional[Path] = None
         self.project_root: Optional[Path] = None
+        self.box_size: Optional[float] = None                   # 只会在新增box时被用到
 
         # 渲染状态变量
         self.base_image: Optional[np.ndarray] = None            # 原始灰度numpy图像数据（高度,宽度）
-        self.display_scale: float = 0.2                         # 当前显示缩放倍数（相对于原始图像）
-        self._undo_stack: List[Dict] = []                       # 撤销操作栈：存储操作记录的字典列表
+        self.display_scale: float = 0.2                         # 当前显示缩放倍数（相对于原始图像） 0.15 - 3
+        # self._undo_stack: List[Dict] = []                       # 撤销操作栈：存储操作记录的字典列表
 
         self.pan_offset = QtCore.QPoint(0, 0)                   # display像素单位的平移偏移（用于绘制）
         self._panning = False
         self._pan_start = None
-        self._pan_start_offset = QtCore.QPoint(0, 0)
+        self._pan_initial_offset = QtCore.QPoint(0, 0)          # 记录拖动开始时的初始偏移
         self._image_draw_pos: Tuple[int, int, int, int] = (0, 0, 0, 0)  # 记录上次渲染的 image 在 label 上的位置（x, y, w, h） 用于坐标转换
         self._brightness: float = 1.0                           # 亮度控制（0.0 - 4.0）
-        self.navigation_context = "all_tiles"                   # Context Awareness("all_tiles" or "manual_list")
+        self._auto_brightness_done: bool = False                # 标志位：是否已对当前Tile进行过自动亮度调节
+        self.navigation_context = "tile_list"                   # Context Awareness("tile_list" or "manual_list")
 
         self._build_ui()
 
     def _build_ui(self):
         layout = QtWidgets.QHBoxLayout(self)
 
-        # --- Left Column: Tile List & Log ---
+        # --- Left Column: Tile List & Manual List ---
         left_widget = QtWidgets.QWidget()
         left_vbox = QtWidgets.QVBoxLayout(left_widget)
         self.tile_list = QtWidgets.QListWidget()                    # 左侧切片列表
         self.tile_list.itemClicked.connect(self.on_tile_list_clicked)   # 连接切片选择信号
-
-        self.log_box = QtWidgets.QTextEdit()                        # 左侧日志框
-        self.log_box.setReadOnly(True)
-        self.log_box.setMaximumHeight(150)
+        self.manual_list = QtWidgets.QListWidget()
+        self.manual_list.itemClicked.connect(self.on_manual_list_clicked)
 
         left_vbox.addWidget(QtWidgets.QLabel("Tile List"))
         left_vbox.addWidget(self.tile_list)
-        left_vbox.addWidget(QtWidgets.QLabel("Log"))
-        left_vbox.addWidget(self.log_box)
+        left_vbox.addWidget(QtWidgets.QLabel("Manual Confirmation List"))
+        left_vbox.addWidget(self.manual_list)
         left_widget.setMaximumWidth(240)
 
         # --- Center Column: Canvas & Basic Controls ---
         center_widget = QtWidgets.QWidget()
         center_vbox = QtWidgets.QVBoxLayout(center_widget)
         self.canvas_label = QtWidgets.QLabel()                       # 中部画布
-        self.canvas_label.setMinimumSize(512, 512)
         self.canvas_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.canvas_label.setMinimumSize(512, 512)
         self.canvas_label.setMouseTracking(True)                    # 启用鼠标跟踪（即使不按下按钮也接收移动事件）
         self.canvas_label.setFocusPolicy(QtCore.Qt.StrongFocus)     # 设置强焦点策略，可以接收键盘事件
         self.canvas_label.installEventFilter(self)                  # 安装事件过滤器，拦截画布上的事件
@@ -655,56 +732,46 @@ class ViewerPanel(QtWidgets.QWidget):
         row2.addWidget(QtWidgets.QLabel("Exclude conf <"))
         row2.addWidget(self.spin_filter_conf)
 
-        self.filter_curr_btn = QtWidgets.QPushButton("Apply to Curr")
-        self.filter_all_btn = QtWidgets.QPushButton("Apply to All")
+        self.filter_curr_btn = QtWidgets.QPushButton("Apply to Curr Tile")
+        self.filter_all_btn = QtWidgets.QPushButton("Apply to All Tiles")
         row2.addWidget(self.filter_curr_btn)
         row2.addWidget(self.filter_all_btn)
 
-        self.delete_btn = QtWidgets.QPushButton("Delete Sel")
-        self.restore_btn = QtWidgets.QPushButton("Restore Sel")
-        self.delete_all_btn = QtWidgets.QPushButton("Delete Curr")
-        self.undo_btn = QtWidgets.QPushButton("Undo")
+        self.delete_btn = QtWidgets.QPushButton("Delete Sel Point")
+        self.delete_all_btn = QtWidgets.QPushButton("Delete Curr Tile")
         self.save_btn = QtWidgets.QPushButton("Save")
 
         row2.addWidget(self.delete_btn)
-        row2.addWidget(self.restore_btn)
         row2.addWidget(self.delete_all_btn)
-        row2.addWidget(self.undo_btn)
         row2.addWidget(self.save_btn)
+
+        self.log_box = QtWidgets.QTextEdit()                        # 最下层日志框
+        self.log_box.setReadOnly(True)
+        self.log_box.setPlaceholderText("log")
+        self.log_box.setMaximumHeight(60)
 
         bottom.addLayout(row1)
         bottom.addLayout(row2)
+        bottom.addWidget(self.log_box)
         center_vbox.addWidget(self.canvas_label, 1)
         center_vbox.addLayout(bottom)
-
-        # --- Right Column: Manual List & Operation Hint---
-        right_widget = QtWidgets.QWidget()
-        right_vbox = QtWidgets.QVBoxLayout(right_widget)
-        self.manual_list_widget = QtWidgets.QListWidget()
-        self.manual_list_widget.itemClicked.connect(self.on_manual_list_clicked)
-        right_vbox.addWidget(QtWidgets.QLabel("Manual Confirmation List"))
-        right_vbox.addWidget(self.manual_list_widget)
-        right_widget.setMaximumWidth(240)
-
         layout.addWidget(left_widget)
         layout.addWidget(center_widget, 1)  # Canvas gets most space
-        layout.addWidget(right_widget)
 
         self.brightness_slider.valueChanged.connect(self.on_brightness_changed)
         self.prev_btn.clicked.connect(self.go_prev)
         self.next_btn.clicked.connect(self.go_next)
         self.delete_btn.clicked.connect(self.delete_selected)
-        self.restore_btn.clicked.connect(self.restore_selected)
         self.delete_all_btn.clicked.connect(self.delete_all_for_tile)
-        self.undo_btn.clicked.connect(self.undo_last)
-        self.save_btn.clicked.connect(self.confirm_and_save)
+        self.save_btn.clicked.connect(self.save_and_confirm)
         self.filter_curr_btn.clicked.connect(lambda: self.apply_conf_filter(current_only=True))
         self.filter_all_btn.clicked.connect(lambda: self.apply_conf_filter(current_only=False))
 
-    def set_dirs(self, nav_folder: Path, project_name: str):
+    def set_dirs(self, nav_folder: Path, cfg: dict):
         """由 MainWindow 在 on_start 时设置 project 子目录路径"""
-        self.project_root = nav_folder / project_name
-        self.images_dir, self.preds_dir = ensure_project_dirs(nav_folder, project_name)
+        self.project_root = nav_folder / cfg["project_name"]
+        self.box_size = cfg["box_size"]
+        self.images_dir, self.preds_dir = ensure_project_dirs(nav_folder, cfg["project_name"])
         self.refresh_manual_list()
 
     def refresh_manual_list(self, tile_name=None):
@@ -713,22 +780,25 @@ class ViewerPanel(QtWidgets.QWidget):
             return
         if tile_name is None:
             items = read_manual_list(self.project_root)
-            self.manual_list_widget.clear()
-            self.manual_list_widget.addItems(items)
+            self.manual_list.clear()
+            self.manual_list.addItems(items)
         else:
-            self.manual_list_widget.addItem(tile_name)
+            self.manual_list.addItem(tile_name)
 
     def on_tile_list_clicked(self, item: QtWidgets.QListWidgetItem):
-        """Handle click on main tile list (Left). Sets context to 'all_tiles'."""
-        self.navigation_context = "all_tiles"
-        idx = item.data(QtCore.Qt.UserRole)
-        self.set_current_tile(idx)
+        self.navigation_context = "tile_list"
+        self.set_current_tile(item.text())
+        self._update_another_list(self.tile_list.currentItem().text(), "manual_list")
 
-    def on_manual_list_clicked(self, item: QtWidgets.QListWidgetItem):
+    def on_manual_list_clicked(self, item: QtWidgets.QListWidgetItem):  # 当点击时，已经有了currentRow
         self.navigation_context = "manual_list"
-        self.tile_selected.emit(item.text())
+        mont_stem, idx = match_name(item.text(), _TILE_RE)
+        if idx != -1:
+            self.tile_selected.emit(mont_stem)  # 更新self.current_montage
+            self.set_current_tile(item.text())
+            self._update_another_list(self.manual_list.currentItem().text(), "tile_list")
 
-    def load_montage(self, montage: Montage):
+    def load_montage(self, montage: Montage, loadlast=True):
         """载入 montage：刷新 tile 列表，自动打开 tile第一项。"""
         self.current_montage = montage
         self.tile_list.clear()
@@ -736,20 +806,18 @@ class ViewerPanel(QtWidgets.QWidget):
             self.clear_canvas()
             return
 
-        for idx in sorted(montage.tiles.keys()):
-            tile = montage.tiles[idx]
-            li = QtWidgets.QListWidgetItem(f"{tile.name}")
-            li.setBackground(QtGui.QColor(STATUS_COLORS.get(tile.status)))
-            li.setData(QtCore.Qt.UserRole, idx)         # 将切片索引存储在用户数据中，便于后续检索
+        for tile_name in sorted(montage.tiles.keys()):
+            li = QtWidgets.QListWidgetItem(tile_name)
             self.tile_list.addItem(li)
 
         # Default select first
-        if self.tile_list.count() > 0:
-            self.set_current_tile(self.tile_list.item(0).data(QtCore.Qt.UserRole))
+        if loadlast and self.tile_list.count() > 0:  # 因为没有点击事件，所以必须手动设置currentRow
+            self.tile_list.setCurrentRow(self.tile_list.count() - 1)
+            self.on_tile_list_clicked(self.tile_list.currentItem())
 
-    def set_current_tile(self, idx: int):
-        self.current_tile_id = idx
-        tile = self.current_montage.tiles.get(idx)
+    def set_current_tile(self, tile_name: str):
+        self.current_tile_name = tile_name
+        tile = self.current_montage.tiles.get(tile_name)
         if not tile:
             self.clear_canvas()
             return
@@ -757,30 +825,22 @@ class ViewerPanel(QtWidgets.QWidget):
         img = cv2.imread(str(tile.tile_file), cv2.IMREAD_UNCHANGED)  # HxW int8
         if img is not None:  # Numpy array is not bool
             self.base_image = img[:, :, 0] if img.ndim == 3 else img  # only read 2D array
+            self._auto_brightness_done = False  # Reset auto brightness flag for new image
 
         mont_name, idx = match_name(tile.name, _TILE_RE)
         pred_name = PRED_NAME_TEMPLATE.format(montage=mont_name, z=idx)
         pred_path = self.preds_dir / pred_name
-        tile.detections = read_detections(pred_path)
+        tile.detections = read_detections(pred_path)  # 同一时间，只会读一个tile的detections，避免占用内存太大
 
         self.pan_offset = QtCore.QPoint(0, 0)  # 重置平移（切片切换时重置为居中）
-        self.selected_det = tile.detections[0]        # 默认选第一个
-        self._undo_stack.clear()        # 重置撤销stack
+        self.selected_det = None        # 重置选择
         self._render_tile(tile)         # 渲染切片
         self.canvas_label.setFocus() #  确保画布获得焦点，以便接收键盘事件
-
-        # 更新切片列表中的选中高亮
-        if self.navigation_context == "all_tiles":
-            for i in range(self.tile_list.count()):
-                it = self.tile_list.item(i)
-                if it.data(QtCore.Qt.UserRole) == idx:
-                    self.tile_list.setCurrentItem(it)
-                    break
 
     def log(self, msg: str):
         """向 log_box 追加一行带时间戳的消息"""
         ts = QtCore.QTime.currentTime().toString("HH:mm:ss")
-        self.log_box.append(f"[{ts}] {msg}\n")
+        self.log_box.append(f"[{ts}] {msg}")
 
     def clear_canvas(self):
         self.base_image = None
@@ -790,6 +850,21 @@ class ViewerPanel(QtWidgets.QWidget):
         """绘制 pixmap 并在其上绘制 detection 框，按 display_scale 缩放显示在 canvas_label 上"""
         if self.base_image is None:
             return
+
+        # Auto Brightness
+        if not self._auto_brightness_done:
+            mean_val = np.mean(self.base_image)
+            if mean_val > 1:  # Avoid division by zero
+                target = 128.0
+                factor = target / mean_val
+                # Clamp factor to slider range 0.4 - 4.0
+                factor = max(0.4, min(factor, 4.0))
+                # Update internal brightness and Slider UI
+                self._brightness = factor
+                self.brightness_slider.blockSignals(True)  # Prevent recursive call
+                self.brightness_slider.setValue(int(factor * 100))
+                self.brightness_slider.blockSignals(False)
+            self._auto_brightness_done = True
 
         # 如果没有修改亮度，直接复用已加载的 pixmap
         if self._brightness != 1.0:
@@ -806,363 +881,193 @@ class ViewerPanel(QtWidgets.QWidget):
         label_w, label_h = self.canvas_label.width(), self.canvas_label.height()
         scaled_w, scaled_h = scaled.width(), scaled.height()
         # 计算放置位置：默认居中 + pan_offset
-        center_x = (label_w - scaled_w) // 2
-        center_y = (label_h - scaled_h) // 2
-        x = int(center_x + self.pan_offset.x())
-        y = int(center_y + self.pan_offset.y())
-
+        x = int((label_w - scaled_w) // 2 + self.pan_offset.x())
+        y = int((label_h - scaled_h) // 2 + self.pan_offset.y())
+        self._image_draw_pos = (x, y, scaled_w, scaled_h)  # 保存当前图像绘制区域位置，方便坐标映射
         # 创建一个与 label 大小一致的画布 pixmap，在其上绘制缩放后的图像（并随后绘制框）
-        canvas_pix = QtGui.QPixmap(label_w, label_h)
+        canvas_pix = QtGui.QPixmap(self.canvas_label.size())
         canvas_pix.fill(QtCore.Qt.white)  # 背景填充
         painter = QtGui.QPainter(canvas_pix)
         painter.drawPixmap(x, y, scaled)
         font = QtGui.QFont("Arial")
         # 使用像素尺寸设定，避免点(size in points)引发跨设备/缩放不一致
-        font.setPixelSize(max(9, int(6 * self.display_scale)))
+        font.setPixelSize(max(11, int(11 * self.display_scale)))
         painter.setFont(font)
 
-        # 遍历所有检测框进行绘制
+        first = True
+        # 遍历所有检测框进行绘制；仅有两种状态：active和filtered；仅绘制active
         for det in tile.detections:
-            # 根据检测框状态和是否被选中选择颜色
-            color_name = STATUS_COLORS.get(det.status)
-            if self.selected_det and det.id == self.selected_det.id:
-                color_name = STATUS_COLORS.get("processing")
+            if det.status == "active":
+                x0 = int((det.x - det.w / 2) * self.display_scale) + x  # 左上角x坐标
+                y0 = int((det.y - det.h / 2) * self.display_scale) + y  # 左上角y坐标
+                w = int(det.w * self.display_scale)
+                h = int(det.h * self.display_scale)
 
-            x0 = int((det.x - det.w / 2) * self.display_scale) + x  # 左上角x坐标
-            y0 = int((det.y - det.h / 2) * self.display_scale) + y  # 左上角y坐标
-            w = int(det.w * self.display_scale)
-            h = int(det.h * self.display_scale)
+                painter.setPen(QtCore.Qt.white)
+                painter.drawText(x0, y0 - 6, f"conf: {det.conf:.2f}")  # Draw Conf (Top-Left)
+                if first:
+                    first = False
+                    painter.drawText(x0, y0 + h + 11, f"1st point for alignment")
 
-            painter.setPen(QtGui.QPen(QtGui.QColor(color_name), 2))
-            painter.drawRect(x0, y0, w, h)
-
-            painter.setPen(QtCore.Qt.white)
-            painter.drawText(x0, y0 - 6, f"conf: {det.conf:.2f}")  # Draw Conf (Top-Left)
-            painter.drawText(x0, y0 + h + 9, f"ID: {det.id}")       # Draw ID (Bottom-Left)
+                color_name = STATUS_COLORS.get("active")
+                if self.selected_det and det == self.selected_det:
+                    color_name = STATUS_COLORS.get("processing")
+                painter.setPen(QtGui.QPen(QtGui.QColor(color_name), 2))
+                painter.drawRect(x0, y0, w, h)
 
         painter.end()
         self.canvas_label.setPixmap(canvas_pix)             # 把最终画布放到 label（pixmap 大小等于 label 大小）
-        self.canvas_label.repaint()  # 强制重绘
-        self._image_draw_pos = (x, y, scaled_w, scaled_h)   # 保存当前图像绘制区域位置，方便坐标映射
-
-    def eventFilter(self, obj, event):
-        # keyboard navigation and canvas events
-        if obj is self.canvas_label:
-            # 添加安全检查：如果没有当前tile或没有基础图像，不处理事件
-            if self.base_image is None or self.current_montage is None or self.current_tile_id is None:
-                return super().eventFilter(obj, event)
-
-            if event.type() == QtCore.QEvent.KeyPress:  # 键盘按键事件
-                if event.key() == QtCore.Qt.Key_Left:
-                    self.go_prev()      # 左箭头 -> 上一个切片
-                if event.key() == QtCore.Qt.Key_Right:
-                    self.go_next()      # 右箭头 -> 下一个切片
-                if event.matches(QtGui.QKeySequence.Undo):
-                    self.undo_last()    # Ctrl+Z -> 撤销操作
-                if event.key() == QtCore.Qt.Key_R:
-                    self.restore_selected()  # R -> 按 R 或 r 恢复选中框
-                if event.key() == QtCore.Qt.Key_S:
-                    self.confirm_and_save()  # S -> 按 S 或 s 恢复选中框
-                if event.key() == QtCore.Qt.Key_Delete:
-                    if event.modifiers() & QtCore.Qt.ShiftModifier:
-                        self.delete_all_for_tile()      # 处理Shift+Delete：删除所有检测框
-                    else:
-                        self.delete_selected()          # 处理Delete：删除选中的检测框
-                return True
-
-            if event.type() == QtCore.QEvent.Wheel:     # 鼠标滚轮事件 - 缩放功能
-                delta = event.angleDelta().y()  # 获取滚轮增量
-                if delta > 0:
-                    self.display_scale *= 1.15  # 向上滚动 -> 放大
-                else:
-                    self.display_scale /= 1.15  # 向下滚动 -> 缩小
-
-                # 限制缩放范围在0.2到4.0之间
-                self.display_scale = min(max(self.display_scale, 0.2), 4.0)
-                # 重新渲染当前切片
-                tile = self.current_montage.tiles.get(self.current_tile_id)
-                if tile:
-                    self._render_tile(tile)
-                return True
-
-            if event.type() == QtCore.QEvent.MouseButtonPress:          # 鼠标按下事件
-                pos = event.pos()                                       # 获取鼠标位置
-                tile = self.current_montage.tiles.get(self.current_tile_id)
-                if not tile:
-                    return True
-
-                img_x, img_y = self._screen_to_image_coords(pos)
-                if event.button() == QtCore.Qt.LeftButton:              # 处理左键点击
-                    clicked = None
-                    for det in tile.detections:
-                        if det.x - det.w/2 <= img_x <= det.x + det.w/2 and det.y - det.h/2 <= img_y <= det.y + det.h/2:
-                            clicked = det
-                            break
-
-                    if clicked:                     # 点击了检测框：选中它
-                        self.selected_det = clicked
-                        self._render_tile(tile)     # 重新渲染以显示选中状态
-                    else:                           # 点击了空白区域
-                        if self.selected_det:       # 有选中框：移动到点击位置
-                            self.move_selected_detection(tile, img_x, img_y)
-                        else:                       # 没有选中框：创建新框
-                            self.add_new_detection(tile, img_x, img_y)
-                elif event.button() == QtCore.Qt.RightButton:           # 处理右键点击 - 取消选择
-                    self.selected_det = None
-                    self._render_tile(tile)  # 重新渲染以更新显示
-                elif event.button() == QtCore.Qt.MiddleButton:          # 处理中键点击 - 启动平移
-                    self._panning = True
-                    self._pan_start = pos
-                return True
-
-            if event.type() == QtCore.QEvent.MouseMove:              # 鼠标移动：如果在平移模式，更新 pan_offset 并重绘；否则忽略
-                if self._panning:
-                    assert self._pan_start is not None
-                    delta = event.pos() - self._pan_start
-                    self.pan_offset = self._pan_start_offset + delta
-                    self._clamp_pan()
-                    tile = self.current_montage.tiles.get(self.current_tile_id)
-                    if tile:
-                        self._render_tile(tile)
-                    return True
-
-            if event.type() == QtCore.QEvent.MouseButtonRelease:    # 鼠标释放：结束平移
-                if self._panning:
-                    self._panning = False
-                    self._pan_start = None
-                    self._pan_start_offset = QtCore.QPoint(0, 0)
-                    return True
-
-        return super().eventFilter(obj, event)
-
-    def _clamp_pan(self):
-        """限制 pan_offset 的范围，避免图像被拖出太远（保持至少 20px 可见）"""
-        label_size = self.canvas_label.size()
-        label_w, label_h = label_size.width(), label_size.height()
-        x, y, scaled_w, scaled_h = self._image_draw_pos
-        # self._image_draw_pos 是基于上次渲染时 center+pan_offset 的值。为了在改变 pan_offset 后获得正确约束，
-        # 我们重新计算 center（未含 pan_offset）
-        center_x = (label_w - scaled_w) // 2
-        center_y = (label_h - scaled_h) // 2
-
-        # 允许的 x(top-left) 范围： [20 - scaled_w, label_w - 20]
-        min_x = 20 - scaled_w
-        max_x = label_w - 20
-        # 转换到 pan_offset 的范围： pan = x - center
-        pan_min = min_x - center_x
-        pan_max = max_x - center_x
-
-        min_y = 20 - scaled_h
-        max_y = label_h - 20
-        pan_min_y = min_y - center_y
-        pan_max_y = max_y - center_y
-
-        # clamp
-        px = max(int(pan_min), min(int(self.pan_offset.x()), int(pan_max)))
-        py = max(int(pan_min_y), min(int(self.pan_offset.y()), int(pan_max_y)))
-        self.pan_offset = QtCore.QPoint(px, py)
+        self.canvas_label.repaint()                         # 强制重绘
 
     def go_prev(self):
-        if self.current_montage is None or self.current_tile_id is None:
+        if self.current_montage is None or self.current_tile_name is None:
             return
-        if self.navigation_context == "manual_list":
-            row = self.manual_list_widget.currentRow()
-            next_row = (row - 1) % self.manual_list_widget.count()
-            self.manual_list_widget.setCurrentRow(next_row)
-            self.on_manual_list_clicked(self.manual_list_widget.currentItem())
-        else:
-            keys = sorted(self.current_montage.tiles.keys())
-            curr_idx_in_keys = keys.index(self.current_tile_id)
-            next_id = keys[(curr_idx_in_keys - 1) % len(keys)]
-            self.set_current_tile(next_id)
+        if self.navigation_context == "manual_list" and self.manual_list.count() > 0:
+            row = self.manual_list.currentRow()
+            prev_row = (row - 1) % self.manual_list.count()
+            self.manual_list.setCurrentRow(prev_row)
+            self.on_manual_list_clicked(self.manual_list.currentItem())
+        elif self.navigation_context == "tile_list" and self.tile_list.count() > 0:
+            row = self.tile_list.currentRow()
+            prev_row = (row - 1) % self.tile_list.count()
+            self.tile_list.setCurrentRow(prev_row)
+            self.on_tile_list_clicked(self.tile_list.currentItem())
+
 
     def go_next(self):
-        if self.current_montage is None or self.current_tile_id is None:
+        if self.current_montage is None or self.current_tile_name is None:
             return
-        if self.navigation_context == "manual_list":
-            row = self.manual_list_widget.currentRow()
-            next_row = (row + 1) % self.manual_list_widget.count()
-            self.manual_list_widget.setCurrentRow(next_row)
-            self.on_manual_list_clicked(self.manual_list_widget.currentItem())
-        else:
-            keys = sorted(self.current_montage.tiles.keys())
-            curr_idx_in_keys = keys.index(self.current_tile_id)
-            next_id = keys[(curr_idx_in_keys + 1) % len(keys)]
-            self.set_current_tile(next_id)
+        if self.navigation_context == "manual_list" and self.manual_list.count() > 0:
+            row = self.manual_list.currentRow()
+            next_row = (row + 1) % self.manual_list.count()
+            self.manual_list.setCurrentRow(next_row)
+            self.on_manual_list_clicked(self.manual_list.currentItem())
+        elif self.navigation_context == "tile_list" and self.tile_list.count() > 0:
+            row = self.tile_list.currentRow()
+            next_row = (row + 1) % self.tile_list.count()
+            self.tile_list.setCurrentRow(next_row)
+            self.on_tile_list_clicked(self.tile_list.currentItem())
+
+    def _update_another_list(self, query_text: str, another_context: str):
+        if another_context == "tile_list":
+            for i in range(self.tile_list.count()):
+                it_text = self.tile_list.item(i).text()
+                if it_text == query_text:
+                    self.tile_list.setCurrentRow(i)
+                    break
+        elif another_context == "manual_list":
+            for i in range(self.manual_list.count()):
+                it_text = self.manual_list.item(i).text()
+                if it_text == query_text:
+                    self.manual_list.setCurrentRow(i)
+                    break
 
     def on_brightness_changed(self, val: int):
         """slider 回调：val 0-400 映射到 0.0-4.0"""
-        if self.current_montage is None or self.current_tile_id is None:
+        if self.current_montage is None or self.current_tile_name is None:
             return
         self._brightness = val / 100.0
-        tile = self.current_montage.tiles.get(self.current_tile_id)
+        tile = self.current_montage.tiles.get(self.current_tile_name)
         self._render_tile(tile)
-
-    def apply_conf_filter(self, current_only: bool):
-        """Mark dets with conf < threshold as deleted."""
-        if self.current_montage is None or self.current_tile_id is None:
-            return
-        thresh = self.spin_filter_conf.value()
-        tiles_to_process = []
-        t = self.current_montage.tiles.get(self.current_tile_id)
-        if current_only:
-            tiles_to_process.append(t)
-        else:
-            # TODO现在这样显然不对！需要好好想想如何能对所有文件操作
-            tiles_to_process = list(self.current_montage.tiles.values())
-
-        count = 0
-        for tile in tiles_to_process:
-            dirty = False
-            for d in tile.detections:
-                if d.status != "deleted" and d.conf < thresh:
-                    d.status = "deleted"
-                    dirty = True
-                    count += 1
-            if dirty:
-                mont_name, idx = match_name(tile.name, _TILE_RE)
-                pred_name = PRED_NAME_TEMPLATE.format(montage=mont_name, z=idx)
-                pred_path = self.preds_dir / pred_name
-                write_detections(pred_path, tile.detections)
-                tile._dirty = True
-
-        self._render_tile(t)
-        self._update_tile_list_item_color(self.current_tile_id, t)
-        self.log(f"Filtered {count} detections < {thresh:.2f}")
 
     def delete_selected(self):
-        if self.selected_det is None or self.current_montage is None or self.current_tile_id is None:
+        if self.selected_det is None or self.current_montage is None or self.current_tile_name is None:
             return
-        tile = self.current_montage.tiles.get(self.current_tile_id)
-        prev_status = self.selected_det.status
-        action = {"type": "status_change",
-                  "tile": self.current_tile_id,
-                  "det_id": self.selected_det.id,
-                  "prev_status": prev_status,
-                  "new_status": "deleted"}
-        self._undo_stack.append(action)
-
+        tile = self.current_montage.tiles.get(self.current_tile_name)
         for d in tile.detections:
-            if d.id == self.selected_det.id:
-                d.status = "deleted"
+            if d == self.selected_det:
+                tile.detections.remove(d)
                 break
         self.selected_det = None
-        tile._dirty = True
-        self._render_tile(tile)
-        self._update_tile_list_item_color(self.current_tile_id, tile)
-
-    def restore_selected(self):
-        """把选中的 detection（如果为 deleted）恢复为 active（并加入 undo 栈）"""
-        if self.current_montage is None or self.current_tile_id is None or self.selected_det is None:
-            return
-        tile = self.current_montage.tiles.get(self.current_tile_id)
-        prev_status = self.selected_det.status
-        self.selected_det.status = "active"
-        action = {"type": "status_change",
-                  "tile": self.current_tile_id,
-                  "det_id": self.selected_det.id,
-                  "prev_status": prev_status,
-                  "new_status": "active"}
-        self._undo_stack.append(action)
-        tile._dirty = True
         self._render_tile(tile)
 
     def delete_all_for_tile(self):
-        if self.current_montage is None or self.current_tile_id is None:
+        if self.current_montage is None or self.current_tile_name is None:
             return
-        tile = self.current_montage.tiles.get(self.current_tile_id)
-        prev = [(d.id, d.status) for d in tile.detections]
-        action = {"type": "bulk_status_change",
-                  "tile": self.current_tile_id,
-                  "prev": prev,
-                  "new_status": "deleted"}
-        self._undo_stack.append(action)
-        for d in tile.detections:
-            d.status = "deleted"
-        tile._dirty = True
+        tile = self.current_montage.tiles.get(self.current_tile_name)
+        tile.detections = []
+        self.selected_det = None
         self._render_tile(tile)
-        self._update_tile_list_item_color(self.current_tile_id, tile)
 
     def move_selected_detection(self, tile, img_x, img_y):
-        prev_xy = (self.selected_det.x, self.selected_det.y)
         # 更新检测框位置
         self.selected_det.x = img_x
         self.selected_det.y = img_y
-        tile._dirty = True
-
-        action = {"type": "move",
-                  "tile": self.current_tile_id,
-                  "det_id": self.selected_det.id,
-                  "prev_xy": prev_xy,
-                  "new_xy": (img_x, img_y)}
-        self._undo_stack.append(action)
         self._render_tile(tile)
 
     def add_new_detection(self, tile, img_x, img_y):
-        # 计算新检测框的参数
-        if tile.detections:
-            last_id = tile.detections[-1].id
-            last_cls = tile.detections[-1].cls
-            last_w = tile.detections[-1].w
-            last_h = tile.detections[-1].h
-        else:
-            last_id = 0
-            last_cls = 0
-            last_w = 150.0
-            last_h = 150.0
-
-        new_id = last_id + 1
-        new_det = Detection(new_id, last_cls, float(img_x), float(img_y), float(last_w), float(last_h), 0.0, "active")
-        tile.detections.append(new_det)
-        tile._dirty = True
-
-        action = {"type": "add",
-                  "tile": self.current_tile_id,
-                  "det_id": new_id}
-        self._undo_stack.append(action)
+        cls, w, h = 0, self.box_size, self.box_size
+        new_det = Detection(cls, img_x, img_y, w, h, 2.0, "active")
+        tile.detections.insert(0, new_det)  # 最后一个会被放到最开始作为对中点
         self.selected_det = new_det
         self._render_tile(tile)
 
-    def undo_last(self):
-        if not self._undo_stack:
+    def apply_conf_filter(self, current_only: bool):
+        """Mark dets with conf < threshold as filtered."""
+        if self.current_montage is None or self.current_tile_name is None:
             return
-        action = self._undo_stack.pop()
-        t_id = action.get("tile")
-        tile = self.current_montage.tiles.get(t_id)
-        if not tile:
+        thresh = self.spin_filter_conf.value()
+        tile_path_to_process = []
+        if current_only:
+            mont, idx = match_name(self.current_tile_name, _TILE_RE)
+            pred_file = PRED_NAME_TEMPLATE.format(montage=mont, z=idx)
+            tile_path_to_process.append(self.preds_dir / pred_file)
+        else:
+            for p in sorted(self.preds_dir.glob("*.txt")):
+                mont, idx = match_name(p.name, _PRED_RE)
+                if idx > -1:
+                    tile_path_to_process.append(p)
+
+        del_count = 0
+        recover_count = 0
+        for tp in tile_path_to_process:
+            dets = read_detections(tp)
+            for d in dets:
+                if d.conf < thresh:
+                    d.status = "filtered"
+                    del_count += 1
+                elif d.conf >= thresh and d.status == "filtered":  # 对于先前被高阈值删除的，则恢复它！
+                    d.status = "active"
+                    recover_count += 1
+            write_detections(tp, dets)
+        if current_only:
+            pre = f"For {tile_path_to_process[0]}: "
+        else:
+            pre = "For all available files: "
+        msg = pre + f"Filtered {del_count} detections with conf < {thresh:.2f}. Restored {recover_count} detections. Auto-Saved."
+        self.log(msg)
+        logger.info(msg)
+        self.set_current_tile(self.current_tile_name)
+
+    def save_and_confirm(self):
+        if self.current_montage is None or self.current_tile_name is None:
             return
 
-        if action["type"] == "status_change":
-            det_id = action["det_id"]
-            for d in tile.detections:
-                if d.id == det_id:
-                    d.status = action["prev_status"]
-                    break
-        elif action["type"] == "bulk_status_change":
-            for det_id, prev_status in action["prev"]:
-                for d in tile.detections:
-                    if d.id == det_id:
-                        d.status = prev_status
-                        break
-            self._update_tile_list_item_color(t_id, tile)
-        elif action["type"] == "move":
-            det_id = action["det_id"]
-            prev_xy = action["prev_xy"]
-            for d in tile.detections:
-                if d.id == det_id:
-                    d.x, d.y = prev_xy
-                    break
-        elif action["type"] == "add":
-            det_id = action["det_id"]
-            new_list = [d for d in tile.detections if d.id != det_id]
-            tile.detections = new_list
-            # 如果当前 selected_det 指向被删除的 detection，清除 selection
-            if self.selected_det and self.selected_det.id == det_id:
-                self.selected_det = None
+        tile = self.current_montage.tiles.get(self.current_tile_name)
+        try:
+            mont_name, idx = match_name(tile.name, _TILE_RE)
+            pred_name = PRED_NAME_TEMPLATE.format(montage=mont_name, z=idx)
+            pred_path = self.preds_dir / pred_name
+            write_detections(pred_path, tile.detections)
+            msg = f"Saved predictions: {pred_path}"
 
-        tile._dirty = True
-        if t_id == self.current_tile_id:        # 如果我们 undo 的正是当前显示的 tile，则重渲染
-            self._render_tile(tile)
+            curr_row = -1
+            for i in range(self.manual_list.count()):
+                item_text = self.manual_list.item(i).text()
+                if item_text == tile.name:
+                    remove_from_manual_list(self.project_root, item_text)
+                    self.manual_list.takeItem(i)
+                    curr_row = i
+                    break
+
+            if 0 <= curr_row < self.manual_list.count():  # Move to next in list
+                self.manual_list.setCurrentRow(curr_row)
+                self.on_manual_list_clicked(self.manual_list.currentItem())
+
+        except Exception as e:
+            msg = f"Failed to save predictions: {e}"
+            logger.error(msg)
+        self.log(msg)
 
     def _screen_to_image_coords(self, screen_pos: QtCore.QPoint) -> Tuple[float, float]:
         """将屏幕坐标（相对于 canvas_label）转换为图像像素坐标（原始图像坐标，非显示坐标）"""
@@ -1186,53 +1091,90 @@ class ViewerPanel(QtWidgets.QWidget):
 
         return img_x, img_y
 
-    def _update_tile_list_item_color(self, idx: int, tile: Tile):
-        """主要是更新切片列表项的背景色为红色或者撤销"""
-        if tile.detections:
-            all_deleted = all(det.status == "deleted" for det in tile.detections)
-            if all_deleted:
-                tile.status = "deleted"
-            else:
-                tile.status = "processed"
+    def eventFilter(self, obj, event):
+        # keyboard navigation and canvas events
+        if obj is self.canvas_label:
+            # 添加安全检查：如果没有当前tile或没有基础图像，不处理事件
+            if self.base_image is None or self.current_montage is None or self.current_tile_name is None:
+                return super().eventFilter(obj, event)
 
-        color = QtGui.QColor(STATUS_COLORS.get(tile.status))
-        for i in range(self.tile_list.count()):
-            it = self.tile_list.item(i)
-            if it.data(QtCore.Qt.UserRole) == idx:
-                it.setBackground(color)
-                break
+            if event.type() == QtCore.QEvent.KeyPress:  # 键盘按键事件
+                if event.key() == QtCore.Qt.Key_Left:
+                    self.go_prev()      # 左箭头 -> 上一个切片
+                if event.key() == QtCore.Qt.Key_Right:
+                    self.go_next()      # 右箭头 -> 下一个切片
+                if event.key() == QtCore.Qt.Key_S:
+                    self.save_and_confirm()  # S -> 按 S 或 s 更新manual_list并保存predictions
+                if event.key() == QtCore.Qt.Key_Delete:
+                    if event.modifiers() & QtCore.Qt.ShiftModifier:
+                        self.delete_all_for_tile()      # 处理Shift+Delete：删除所有检测框
+                    else:
+                        self.delete_selected()          # 处理Delete：删除选中的检测框
+                return True
 
-    def confirm_and_save(self):
-        if self.current_montage is None or self.current_tile_id is None:
-            return
+            if event.type() == QtCore.QEvent.Wheel:     # 鼠标滚轮事件 - 缩放功能
+                delta = event.angleDelta().y()  # 获取滚轮增量
+                if delta > 0:
+                    self.display_scale *= 1.15  # 向上滚动 -> 放大
+                else:
+                    self.display_scale /= 1.15  # 向下滚动 -> 缩小
 
-        curr_row = self.manual_list_widget.currentRow()
-        if curr_row >= 0:
-            try:
-                item_text = self.manual_list_widget.item(curr_row).text()
-                remove_from_manual_list(self.project_root, item_text)
-                self.manual_list_widget.takeItem(curr_row)
+                # 限制缩放范围在0.1到3.0之间
+                self.display_scale = min(max(self.display_scale, 0.15), 3.0)
+                # 重新渲染当前切片
+                tile = self.current_montage.tiles.get(self.current_tile_name)
+                if tile:
+                    self._render_tile(tile)
+                return True
 
-                tile = self.current_montage.tiles.get(self.current_tile_id)
-                mont_name, idx = match_name(tile.name, _TILE_RE)
-                pred_name = PRED_NAME_TEMPLATE.format(montage=mont_name, z=idx)
-                pred_path = self.preds_dir / pred_name
-                write_detections(pred_path, tile.detections)
-                tile._dirty = False  # 清除修改标记
-                msg = f"Saved predictions: {pred_path}"
+            if event.type() == QtCore.QEvent.MouseButtonPress:          # 鼠标按下事件
+                pos = event.pos()                                       # 获取鼠标位置
+                tile = self.current_montage.tiles.get(self.current_tile_name)
+                if not tile:
+                    return True
 
-                # Move to next in list
-                if curr_row < self.manual_list_widget.count():
-                    self.manual_list_widget.setCurrentRow(curr_row)
-                    self.on_manual_list_clicked(self.manual_list_widget.currentItem())
-                elif self.manual_list_widget.count() > 0:
-                    self.manual_list_widget.setCurrentRow(0)
-                    self.on_manual_list_clicked(self.manual_list_widget.currentItem())
-            except Exception as e:
-                msg = f"Failed to save predictions: {e}"
-                logger.error(msg)
-            self.log(msg)
+                img_x, img_y = self._screen_to_image_coords(pos)
+                if event.button() == QtCore.Qt.LeftButton:              # 处理左键点击
+                    clicked = None
+                    for det in tile.detections:
+                        if det.x - det.w/2 <= img_x <= det.x + det.w/2 and det.y - det.h/2 <= img_y <= det.y + det.h/2:
+                            clicked = det
+                            break
+                    if clicked:                     # 点击了检测框：选中它
+                        self.selected_det = clicked
+                        self._render_tile(tile)     # 重新渲染以显示选中状态
+                    else:                           # 点击了空白区域
+                        if self.selected_det:       # 有选中框：移动到点击位置
+                            self.move_selected_detection(tile, img_x, img_y)
+                        else:                       # 没有选中框：创建新框
+                            self.add_new_detection(tile, img_x, img_y)
+                    return True
+                elif event.button() == QtCore.Qt.RightButton:           # 处理右键点击 - 取消选择
+                    self.selected_det = None
+                    self._render_tile(tile)  # 重新渲染以更新显示
+                    return True
+                elif event.button() == QtCore.Qt.MiddleButton:          # 处理中键点击 - 启动平移
+                    self._panning = True
+                    self._pan_start = pos
+                    self._pan_initial_offset = self.pan_offset  # 记录当前偏移量作为起点
+                    return True
 
+            if event.type() == QtCore.QEvent.MouseMove:              # 鼠标移动：如果在平移模式，更新 pan_offset 并重绘；否则忽略
+                if self._panning:
+                    assert self._pan_start is not None
+                    self.pan_offset = self._pan_initial_offset + (event.pos() - self._pan_start)
+                    tile = self.current_montage.tiles.get(self.current_tile_name)
+                    if tile:
+                        self._render_tile(tile)
+                    return True
+
+            if event.type() == QtCore.QEvent.MouseButtonRelease:    # 鼠标释放：结束平移
+                if self._panning:
+                    self._panning = False
+                    self._pan_start = None
+                    return True
+
+        return super().eventFilter(obj, event)
 
 # -----------------------------
 # Main Window
@@ -1270,7 +1212,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.stop_requested.connect(self.on_stop)
         self.settings.export_requested.connect(self.on_export)
         self.status.montage_selected.connect(self.on_montage_selected)      # 状态面板的选择信号
-        self.viewer.tile_selected.connect(self.on_tile_selected)            # viewer面板的Manual List的选择tile信号
+        self.viewer.tile_selected.connect(self.on_tile_selected)  # viewer面板的Manual List的选择tile信号
 
         self.worker: Optional[MontageProcessor] = None                      # 工作进程
         self.observer: Optional[Observer] = None                            # 文件系统观察者，用于监控新文件
@@ -1284,9 +1226,8 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             nav_folder = cfg["nav_path"].parent
             self.montages = load_nav_and_montages(cfg["nav_path"], cfg["project_name"], cfg["overwrite"])
-            self.status.montages = self.montages
-            self.status.refresh()
-            self.viewer.set_dirs(nav_folder, cfg["project_name"])
+            self.status.refresh(self.montages)
+            self.viewer.set_dirs(nav_folder, cfg)
 
             # Watcher
             if self.observer:
@@ -1305,7 +1246,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for m in self.montages.values():
                 if m.status == "not generated" and m.map_file.exists():
                     m.status = "queuing"
-                    self.ui_queue.put(("update_montage", m))
+                    self.ui_queue.put(("update_montage_status", (m, None)))
                     self.job_queue.put(m)
 
         except Exception as e:
@@ -1323,39 +1264,38 @@ class MainWindow(QtWidgets.QMainWindow):
             # Wait a bit for it to finish current tile, but don't freeze UI forever
             self.worker.wait(10000)
 
-        # NOTE: Do NOT clear queues forcefully. Let them drain naturally or just exist.
-        # Clearing them risks deleting data that the worker just finished but hasn't been saved/displayed.
         logger.info("Processing stopped.")
 
     def on_export(self, cfg: dict):
         msg = add_predictions_to_nav(cfg["nav_path"], cfg["project_name"], cfg["save_path"])
-        QtWidgets.QMessageBox.information(self, "Export", msg)
+        self.viewer.log(msg)
         logger.info(msg)
 
-    def on_montage_selected(self, name: str):
+    def on_montage_selected(self, name: str):  # load montage 选第0个
         if name in self.montages:
-            self.viewer.load_montage(self.montages[name])
+            self.viewer.load_montage(self.montages[name], loadlast=True)
 
-    def on_tile_selected(self, tile_name: str):
-        mont_stem, idx = match_name(tile_name, _TILE_RE)
+    def on_tile_selected(self, mont_stem: str):
         last_key = list(self.montages.keys())[-1]
         name = mont_stem + str(self.montages[last_key].map_file.suffix)
-        if idx != -1 and name in self.montages:
-            self.viewer.load_montage(self.montages[name])
-            self.viewer.set_current_tile(idx)
+        if name in self.montages:
+            self.viewer.load_montage(self.montages[name], loadlast=False)
 
     def process_ui_queue(self):
         """Called from main thread to process updates from worker threads"""
         while not self.ui_queue.empty():
             try:
                 cmd = self.ui_queue.get_nowait()
-                if cmd[0] == "update_montage":
-                    mont = cmd[1]
+                if cmd[0] == "update_montage_status":
+                    mont, msg = cmd[1]
                     self.status.update_montage(mont)
-                elif cmd[0] == "refresh_tile_list":
-                    name = cmd[1]
-                    if self.viewer.current_montage and self.viewer.current_montage.name == name:
-                        self.viewer.load_montage(self.montages[name])
+                    if msg:
+                        self.viewer.log(msg)
+                elif cmd[0] == "add_tile_item":
+                    mont, msg = cmd[1]
+                    self.viewer.log(msg)
+                    if self.viewer.current_montage and self.viewer.current_montage == mont:
+                        self.viewer.load_montage(mont, loadlast=True)
                 elif cmd[0] == "add_manual_item":
                     tile_name = cmd[1]
                     self.viewer.refresh_manual_list(tile_name)
