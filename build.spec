@@ -1,13 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
-# PyInstaller Spec File for gui.py
-# 此配置将创建目录形式的打包 (非单个exe, 即 --onedir 模式).
+# pyinstaller build.spec
+# 此配置将创建目录形式的打包 (非单个可执行文件, 即 --onedir 模式).
 
 import sys
 from PyInstaller.utils.hooks import collect_all
 
 # --- Analysis (分析阶段) ---
-# main.py 是您的主脚本文件
 a = Analysis(
     ['src/gui.py'],
     pathex=['.'], # 搜索路径，当前目录
@@ -43,14 +42,13 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False, # 如果是纯 GUI 应用，可以改为 False
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # 设置程序图标，路径是相对于 spec 文件的
-    icon='data/pp.ico',
+    icon='data/pp_gemini.ico',  # 设置程序图标，路径是相对于 spec 文件的
 )
 
 # --- COLLECT (收集) ---

@@ -214,15 +214,25 @@ class MontageProcessor(QtCore.QThread):
                     if not pred_path.exists() or self.cfg.get('overwrite', False):
                         # A. Run YOLO
                         dets, s_pre, s_infer, s_post = self.predictor.predict_image(str(tile_path), self.cfg)
-
-                        # B. Find Center Point
                         centering_time = time.time()
-                        center_det = self._find_center_point(img_norm, dets)
-                        if center_det:  # Add to front of list
-                            dets.insert(0, center_det)
-                        else:  # Not found: Signal UI to add to manual list
+                        if len(dets) == 0:
                             append_to_manual_list(self.project_root, tile_name)
-                            self.ui_queue.put(("add_manual_item", tile_name))
+                            msg = f"For {tile_name}: cannot find any points, added to manual confirmation list."
+                            logger.info(msg)
+                            self.ui_queue.put(("add_manual_item", (tile_name, msg)))
+                        else:
+                            # B. Find Center Point
+                            # center_det = self._find_center_point(img_norm, dets)  # TOO BAD
+                            # center_det = self._find_center_point_kmeans(img_norm, dets)  # 15/31 -> 12/32
+                            # center_det = self._find_center_point_dbscan(img_norm, dets)  # TOO SLOW
+                            center_det = self._find_center_point_fft(img_norm, dets)  # FASTEST 6/32 -> 7/32 -> 9/32 -> 10/32 -> 8/32 -> 8/32 -> 6/32 -> 8/32
+                            if center_det:  # Add to front of list
+                                dets.insert(0, center_det)
+                            else:  # Not found: Signal UI to add to manual list
+                                append_to_manual_list(self.project_root, tile_name)
+                                msg = f"For {tile_name}: cannot find the tracking point, added to manual confirmation list."
+                                logger.info(msg)
+                                self.ui_queue.put(("add_manual_item", (tile_name, msg)))
 
                         centering_time = time.time() - centering_time
                         write_detections(pred_path, dets)
@@ -244,7 +254,7 @@ class MontageProcessor(QtCore.QThread):
 
     def _find_center_point(self, img: np.ndarray, existing_dets: List[Detection]) -> Optional[Detection]:
         """
-        Algorithm to find a suitable carbon film spot in the center 1/16th area.
+        Algorithm to find a suitable carbon film spot in the center 1/4th area.
         Constraints: No overlap with YOLO boxes, pixels not close to 0 or 255, darker than surroundings.
         """
         h, w = img.shape
@@ -256,7 +266,7 @@ class MontageProcessor(QtCore.QThread):
         # Heuristic: Search this area with a stride
         stride = max(32, box_size // 4)
         candidates = []
-
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
         global_mean = np.mean(img)
         for y in range(y_start, y_end - box_size, stride):
             for x in range(x_start, x_end - box_size, stride):
@@ -264,7 +274,7 @@ class MontageProcessor(QtCore.QThread):
                 roi = img[y: y + box_size, x: x + box_size]
                 # Check 1: Pixel value extremes (Ice vs Vacuum)
                 # "Not too close to 0 (ice), not too close to 255 (vacuum)"
-                if np.min(roi) < 10 or np.max(roi) > 245:
+                if np.min(roi) < 24 or np.max(roi) > 240:
                     continue
                 mean_val = np.mean(roi)
                 # Check 2: Darker than surroundings (Carbon is darker than ice/vacuum usually in normalized)
@@ -281,6 +291,241 @@ class MontageProcessor(QtCore.QThread):
         candidates.sort(key=lambda c: c[0])
         best = candidates[0]
         return Detection(cls=0, x=best[1], y=best[2], w=float(box_size), h=float(box_size), conf=2.0, status="active")  # conf 2.0 indicates generated point
+
+    def _find_center_point_kmeans(self, img: np.ndarray, existing_dets: List[Detection]) -> Optional[Detection]:
+        """
+        Robust Center Finder using K-Means Clustering and Distance Transform.
+        1. Downsample and K-Means cluster into classes.
+        2. Isolate the Darker class (Carbon).
+        3. Erode to remove noise and shrink away from edges/holes.
+        4. Use Distance Transform to find the 'safest' point (furthest from boundaries).
+        5. Verify no overlap with existing YOLO boxes.
+        """
+        h, w = img.shape
+        box_size = self.cfg["box_size"]
+        # 1. Downsample for speed
+        scale_factor = 512.0 / max(h, w)
+        if scale_factor < 1.0:
+            small_img = cv2.resize(img, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
+        else:
+            small_img = img.copy()
+            scale_factor = 1.0
+
+        # --- Preprocessing---
+        # A. Denoise: Use GaussianBlur to suppress high-frequency noise so K-Means clusters regions, not pixels.
+        # A kernel size of (5, 5) or (7, 7) is effective for typical EM images.
+        small_img = cv2.GaussianBlur(small_img, (3, 3), 0)
+        # B. Contrast Enhancement: Normalize to full 0-255 range to help separate clusters.
+        small_img = cv2.normalize(small_img, None, 0, 255, cv2.NORM_MINMAX)
+        # C. 排除亮度过低或过高的区域
+        intensity_mask = cv2.inRange(small_img, 32, 224)
+
+        # 2. KMeans
+        # Reshape to 1D array of float32
+        pixel_values = small_img.reshape((-1, 1)).astype(np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+        K = 3
+        # cv2.kmeans returns: compactionness, labels, centers
+        _, labels, centers = cv2.kmeans(pixel_values, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+
+        # Sort centers to identify classes: 0=Dark (Ice/Carbon), 1=Bright (Spot/Holes)
+        centers = centers.flatten()
+        sorted_indices = np.argsort(centers)
+        carbon_label_idx = sorted_indices[1]
+
+        # Create binary mask for Carbon
+        labels = labels.reshape(small_img.shape)
+        mask = (labels == carbon_label_idx).astype(np.uint8) * 255
+
+        # 3. Morphology cleaning
+        # Open operation to remove small noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        # Erode to shrink regions (stay away from transition zones)
+        mask = cv2.erode(mask, kernel, iterations=2)
+
+        # 4. Find valid area near center
+        # We prefer points closer to the image center.
+        # Create a "Center Preference" map (Distance from center of image)
+        sh, sw = small_img.shape
+        center_x_small, center_y_small = sw // 2, sh // 2
+        # Only look at the mask area. If mask is empty, fallback.
+        if cv2.countNonZero(mask) == 0:
+            return None
+
+        # Distance Transform: value is distance to nearest zero pixel (boundary)
+        # High value = safely inside a carbon region
+        dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+
+        # --- Mask out everything except central 1/4 area ---
+        roi_mask = np.zeros_like(dist_transform, dtype=np.uint8)
+        roi_x1, roi_x2 = int(sw * 0.25), int(sw * 0.75)
+        roi_y1, roi_y2 = int(sh * 0.25), int(sh * 0.75)
+        roi_mask[roi_y1:roi_y2, roi_x1:roi_x2] = 1
+        final_mask = cv2.bitwise_and(intensity_mask, roi_mask)
+        # Apply ROI mask to distance transform (zero out values outside)
+        dist_transform = dist_transform * final_mask
+
+        # Get coordinates of all non-zero points in dist_transform
+        ys, xs = np.nonzero(dist_transform > (box_size * scale_factor * 0.2))  # At least some buffer
+        if len(xs) == 0:
+            return None
+
+        candidates = []
+        for x, y in zip(xs, ys):
+            # Safe distance score
+            d_boundary = dist_transform[y, x]
+            # Centrality score (negative distance to center)
+            d_center = -((x - center_x_small) ** 2 + (y - center_y_small) ** 2) ** 0.5
+            # Combine scores.
+            score = d_boundary * 1 + d_center * 1
+            candidates.append((score, x, y))
+        # Sort by score descending
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        # 5. Check overlap with existing boxes
+        final_cx, final_cy = None, None
+
+        # Optimization: Check top candidates
+        for _, cx_small, cy_small in candidates[:50]:
+            # Convert back to original scale
+            cx_orig = cx_small / scale_factor
+            cy_orig = cy_small / scale_factor
+
+            if not self._check_overlap(cx_orig, cy_orig, box_size * 4, existing_dets):
+                final_cx, final_cy = cx_orig, cy_orig
+                break
+
+        if final_cx is not None:
+            return Detection(cls=0, x=final_cx, y=final_cy, w=float(box_size), h=float(box_size), conf=2.0, status="active")
+        return None
+
+    def _find_center_point_fft(self, img: np.ndarray, existing_dets: List[Detection]) -> Optional[Detection]:
+        """
+        Identify Carbon areas using FFT High-Pass Filtering.
+        Carbon has texture (medium high-freq energy), Holes are smooth (low energy), Edges are sharp (very high energy).
+        """
+        h, w = img.shape
+        box_size = self.cfg["box_size"]
+
+        # 1. Downsample for speed (Processing at 512px is sufficient for texture analysis)
+        scale_factor = 512.0 / max(h, w)
+        if scale_factor < 1.0:
+            small_img = cv2.resize(img, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
+        else:
+            small_img = img.copy()
+            scale_factor = 1.0
+
+        sh, sw = small_img.shape
+        small_img = cv2.normalize(small_img, None, 0, 255, cv2.NORM_MINMAX)
+        # 2. FFT High Pass Filter to extract "Structure/Texture" map
+        f = np.fft.fft2(small_img.astype(np.float32))
+        fshift = np.fft.fftshift(f)
+        # Mask out center (Low Frequencies) - removing illumination/gradients
+        crow, ccol = sh // 2, sw // 2
+        # Mask radius: ~2% of image size is usually enough to remove "flat" components
+        mask_rad = int(min(sh, sw) * 0.02)
+        fshift[crow - mask_rad:crow + mask_rad, ccol - mask_rad:ccol + mask_rad] = 0
+        # Inverse FFT to get structure image
+        f_ishift = np.fft.ifftshift(fshift)
+        img_back = np.fft.ifft2(f_ishift)
+        img_back = np.abs(img_back)
+
+        # 3. Analyze Texture Energy
+        # Smooth the structure map to get regional texture estimates
+        texture_map = cv2.GaussianBlur(img_back, (9, 9), 0)
+        # Normalize to 0-255 for thresholding
+        texture_map = cv2.normalize(texture_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+        # 4. Thresholding to find "Carbon"
+        # - Low Texture (< T1) -> Holes / Flat Ice (Too smooth)
+        # - High Texture (> T2) -> Edges / Grid Bars / Contaminants (Too sharp)
+        # - Medium Texture -> Carbon
+        # Dynamic Thresholding based on image statistics is more robust than fixed values
+        mean_val = np.mean(texture_map)
+        std_val = np.std(texture_map)
+        # Carbon typically lies around the mean noise level
+        # Holes are significantly below mean; Edges are significantly above.
+        lower_thresh = mean_val - 0.5 * std_val  # Cut off very smooth areas
+        upper_thresh = mean_val + 2.0 * std_val  # Cut off strong edges
+        # Create Binary Mask
+        # lower < texture < upper)
+        texture_mask = cv2.inRange(texture_map, lower_thresh, upper_thresh)
+
+        # 5. Clean up Mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        texture_mask = cv2.morphologyEx(texture_mask, cv2.MORPH_OPEN, kernel)  # Remove noise specks
+        texture_mask = cv2.erode(texture_mask, kernel, iterations=2)  # Shrink away from edges
+        intensity_mask = cv2.inRange(small_img, 25, 200)
+        masked_by_intensity = cv2.bitwise_and(texture_mask, intensity_mask)
+
+        # 6. Apply Central 1/4 ROI Constraint
+        roi_mask = np.zeros_like(masked_by_intensity)
+        roi_x1, roi_x2 = int(sw * 0.25), int(sw * 0.75)
+        roi_y1, roi_y2 = int(sh * 0.25), int(sh * 0.75)
+        roi_mask[roi_y1:roi_y2, roi_x1:roi_x2] = 255
+        # Combine Carbon Mask and ROI
+        final_mask = cv2.bitwise_and(masked_by_intensity, roi_mask)
+        if cv2.countNonZero(final_mask) == 0:
+            logger.warning(f"FFT: No valid carbon area found in center.")
+            return None
+
+        # 7. Distance Transform to find the "deepest" point inside the valid carbon area
+        dist_transform = cv2.distanceTransform(final_mask, cv2.DIST_L2, 5)
+        # Add a bias towards image center
+        center_x_small, center_y_small = sw // 2, sh // 2
+        y_grid, x_grid = np.indices((sh, sw))
+        # Distance from image center (normalized)
+        dist_from_center = np.sqrt((x_grid - center_x_small) ** 2 + (y_grid - center_y_small) ** 2)
+        max_dist_center = np.sqrt(center_x_small ** 2 + center_y_small ** 2)
+        # Centrality Score: 1.0 at center, 0.0 at corners
+        centrality_map = 1.0 - (dist_from_center / max_dist_center)
+        # Final Score = Safety (Distance from edges) * Weight + Centrality * Weight
+        # We value Safety more than Centrality to avoid edges
+        score_map = dist_transform + (centrality_map * (box_size * scale_factor * 0.2))
+
+        # Get candidates
+        # Only look at points with valid distance > buffer (2 pixels in small_img)
+        # Must be within final_mask to ensure texture and intensity constraints are met
+        ys, xs = np.nonzero(cv2.bitwise_and(final_mask, (dist_transform > 2.0).astype(np.uint8)))
+        if len(xs) == 0:
+            return None
+
+        candidates = []
+        for x, y in zip(xs, ys):
+            score = score_map[y, x]
+            candidates.append((score, x, y))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        # 8. Check Overlap
+        final_cx, final_cy = None, None
+        for _, cx_small, cy_small in candidates[:50]:
+            cx_orig = cx_small / scale_factor
+            cy_orig = cy_small / scale_factor
+            if not self._check_overlap(cx_orig, cy_orig, box_size * 4, existing_dets):
+                half_box = int(box_size * scale_factor // 2)
+                x1 = max(0, int(cx_small) - half_box)
+                y1 = max(0, int(cy_small) - half_box)
+                x2 = min(w, int(cx_small) + half_box)
+                y2 = min(h, int(cy_small) + half_box)
+                # Extract the candidate box from original image
+                candidate_box = small_img[y1:y2, x1:x2]
+                # Check if box contains very bright pixels (holes)
+                # Using a threshold close to 255 to detect holes
+                bright_pixels = np.sum(candidate_box > 200)
+                # If too many bright pixels are found, skip this candidate (it has holes)
+                max_allowed_bright_pixels = candidate_box.size * 0.01  # Allow up to 1% bright pixels
+                if bright_pixels > max_allowed_bright_pixels:
+                    continue  # Skip this candidate, it has holes
+
+                final_cx, final_cy = cx_orig, cy_orig
+                break
+
+        if final_cx is not None:
+            return Detection(cls=0, x=final_cx, y=final_cy, w=float(box_size), h=float(box_size), conf=2.0, status="active")
+
+        return None
 
     def _deduplicate_montage(self, montage: Montage, preds_dir: Path) -> int:
         """
@@ -810,6 +1055,8 @@ class ViewerPanel(QtWidgets.QWidget):
             li = QtWidgets.QListWidgetItem(tile_name)
             self.tile_list.addItem(li)
 
+        self._update_tile_item_colors()
+
         # Default select first
         if loadlast and self.tile_list.count() > 0:  # 因为没有点击事件，所以必须手动设置currentRow
             self.tile_list.setCurrentRow(self.tile_list.count() - 1)
@@ -907,7 +1154,7 @@ class ViewerPanel(QtWidgets.QWidget):
                 painter.drawText(x0, y0 - 6, f"conf: {det.conf:.2f}")  # Draw Conf (Top-Left)
                 if first:
                     first = False
-                    painter.drawText(x0, y0 + h + 11, f"1st point for alignment")
+                    painter.drawText(x0, y0 + h + 11, f"1st point for tracking")
 
                 color_name = STATUS_COLORS.get("active")
                 if self.selected_det and det == self.selected_det:
@@ -1064,10 +1311,39 @@ class ViewerPanel(QtWidgets.QWidget):
                 self.manual_list.setCurrentRow(curr_row)
                 self.on_manual_list_clicked(self.manual_list.currentItem())
 
+            self._update_tile_item_colors()
+
         except Exception as e:
             msg = f"Failed to save predictions: {e}"
             logger.error(msg)
         self.log(msg)
+
+    def _update_tile_item_colors(self):
+        """遍历 tile_list，读取每个 tile 的 pred 文件；如果没有任何 status == 'active' 的 detection 就把该 item 背景设为浅红色"""
+        if not self.current_montage:
+            return
+
+        for i in range(self.tile_list.count()):
+            item = self.tile_list.item(i)
+            tile_name = item.text()
+            mont_name, idx = match_name(tile_name, _TILE_RE)
+            if idx == -1:
+                continue
+            pred_name = PRED_NAME_TEMPLATE.format(montage=mont_name, z=idx)
+            pred_path = self.preds_dir / pred_name
+
+            has_active = False
+            dets = read_detections(pred_path)
+            for d in dets:
+                if d.status == "active" and d.conf <= 1.0:
+                    has_active = True
+                    break
+
+            if not has_active:
+                item.setBackground(QtGui.QBrush(QtGui.QColor(STATUS_COLORS.get("deleted"))))
+            else:
+                # Reset background
+                item.setBackground(QtGui.QBrush(QtCore.Qt.NoBrush))
 
     def _screen_to_image_coords(self, screen_pos: QtCore.QPoint) -> Tuple[float, float]:
         """将屏幕坐标（相对于 canvas_label）转换为图像像素坐标（原始图像坐标，非显示坐标）"""
@@ -1183,6 +1459,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Point Picker")
+        icon = self.get_resource_path("data/pp_gemini.ico")
+        self.setWindowIcon(QtGui.QIcon(str(icon)))
         self.resize(1200, 800)
 
         # 初始化内部处理管道的数据队列 - 生产者-消费者模式的关键组件
@@ -1220,6 +1498,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer()                                        # 创建定时器用于定期从UI队列中处理更新
         self.timer.timeout.connect(self.process_ui_queue)
         self.timer.start(200)                                               # 启动定时器，每200毫秒触发一次
+
+    @staticmethod
+    def get_resource_path(relative_path: str) -> Path:
+        """兼容 PyInstaller 打包与源码运行"""
+        if hasattr(sys, "_MEIPASS"):                            # 运行在 PyInstaller 打包环境
+            base_path = Path(sys._MEIPASS)
+        else:
+            base_path = Path(__file__).resolve().parent.parent  # src 的上级目录
+
+        return (base_path / relative_path).resolve()
 
     def on_start(self, cfg: dict):
         """Initialize workers and load data."""
@@ -1288,16 +1576,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 cmd = self.ui_queue.get_nowait()
                 if cmd[0] == "update_montage_status":
                     mont, msg = cmd[1]
-                    self.status.update_montage(mont)
                     if msg:
                         self.viewer.log(msg)
+                    self.status.update_montage(mont)
                 elif cmd[0] == "add_tile_item":
                     mont, msg = cmd[1]
                     self.viewer.log(msg)
                     if self.viewer.current_montage and self.viewer.current_montage == mont:
                         self.viewer.load_montage(mont, loadlast=True)
                 elif cmd[0] == "add_manual_item":
-                    tile_name = cmd[1]
+                    tile_name, msg = cmd[1]
+                    self.viewer.log(msg)
                     self.viewer.refresh_manual_list(tile_name)
             except Empty:
                 break
