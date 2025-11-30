@@ -732,7 +732,7 @@ class SettingsPanel(QtWidgets.QWidget):
         self.conf.setValue(0.25)
         layout.addRow("conf:", self.conf)
 
-        # iou (0.0 - 1.0)
+        # iou (0.0 - 1.0) 较低的数值可以消除重叠的方框，从而减少检测次数，这对减少重复检测非常有用。i.e.数值越大，挑的越多，但会重复。
         self.iou = QtWidgets.QDoubleSpinBox()
         self.iou.setRange(0.0, 1.0)
         self.iou.setSingleStep(0.01)

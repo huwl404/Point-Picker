@@ -19,7 +19,7 @@ a = Analysis(
     hiddenimports=[],
     hookspath=[],
     runtime_hooks=[],
-    excludes=[],
+    excludes=[],  # excludes=['cv2.qt.plugins'], for linux
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=None,

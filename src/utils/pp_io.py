@@ -31,6 +31,12 @@ _TILE_RE = re.compile(r"(?P<mont>.+)_tile(?P<idx>\d+)\.png$")
 _PRED_RE = re.compile(r"(?P<mont>.+)_tile(?P<idx>\d+)\.txt$")
 
 
+def normalize_path(path_str: str) -> Path:
+    """将路径标准化为当前系统的格式，因Linux下的Path不支持解析Windows路径"""
+    # 将Windows路径分隔符转换为当前系统的分隔符
+    normalized = path_str.replace('\\', os.sep).replace('/', os.sep)
+    return Path(normalized)
+
 def ensure_project_dirs(nav_folder: Path, project_name: str) -> Tuple[Path, Path]:
     """Create and return images and predictions directories."""
     project_root = nav_folder / project_name
@@ -81,7 +87,7 @@ def load_nav_and_montages(nav_path: Path, project_name: str, overwrite: bool) ->
             mapid = getattr(it, "MapID", None)
             mapfile = getattr(it, "MapFile", None)
             mapframes = getattr(it, "MapFramesXY", None)
-            mont = Montage(name=Path(mapfile).name, map_id=mapid, map_file=Path(mapfile), map_frames=mapframes)
+            mont = Montage(name=normalize_path(mapfile).name, map_id=mapid, map_file=normalize_path(mapfile), map_frames=mapframes)
             montages[mont.name] = mont
         # ignore 0 -> point & 1 -> polygon
 
@@ -208,7 +214,7 @@ def build_map_lookup(items) -> Dict[str, NavItem]:
     lookup = {}
     for it in items:
         if getattr(it, 'kind', None) == 'Map':
-            stem = Path(it.MapFile).stem
+            stem = normalize_path(it.MapFile).stem
             lookup[stem] = it
     return lookup
 
