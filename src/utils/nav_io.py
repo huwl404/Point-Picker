@@ -122,7 +122,7 @@ INTEGER = ('Color', 'NumPts', 'Draw', 'Regis',
            'MapID', 'PieceOn', 'Acquire', 'DrawnID',
            'MontBinning', 'SamePosId', 'OrigReg',
            # added by wanlong
-           'FitToPolygonID', 'ShiftCohortID',
+           'FitToPolygonID', 'ShiftCohortID', 'MontParamIndex', 'FilePropIndex',
            # mdoc
            'SpotSize',
            'Binning', 'CameraIndex', 'DividedBy2', 'MagIndex',
@@ -160,7 +160,7 @@ FLOAT = ('MapExposure', 'MapIntensity', 'MapTiltAngle', 'MapSettling',
          )
 
 # str
-STRING = ('MapFile', 'Note',
+STRING = ('MapFile', 'Note', 'FileToOpen',
           # .mdoc
           'DateTime', 'ImageFile', 'NavigatorLabel',
           'SubFramePath', 'ChannelName',
@@ -195,7 +195,19 @@ INTEGER_LIST = ('MapWidthHeight', 'MapFramesXY',
                 'SuperMontXY',
                 )
 
-UNDEFINED = ()
+PASSED_TAG = ('MontParam', 'XFrame', 'YFrame', 'XNframes', 'YNframes', 'XOverlap', 'YOverlap',
+             'OverviewBinning', 'OfferToMakeMap', 'CloseMontWhenDone', 'AdjustFocus', 'CorrectDrift',
+             'FocusAfterStage', 'RepeatFocus', 'DriftLimit', 'ShowOverview', 'ShiftInOverview', 'VerySloppy',
+             'EvalMultiplePeaks', 'NumToSkip', 'IgnoreSkipList', 'InsideNavItem', 'SkipOutsidePoly', 'WasFitToPolygon',
+             'UseMontMapParams', 'UseViewInLowDose', 'UseSearchInLowDose', 'UseMultiShot', 'SetupInLowDose',
+             'UseContinuousMode', 'ContinDelayFactor', 'NoDriftCorr', 'NoHQDriftCorr', 'UseHqParams', 'FocusInBlocks',
+             'FocusBlockSize', 'ImShiftInBlocks', 'BlockShiftLimit', 'BlockLMShiftLimit', 'RealignToPiece', 'RealignInterval',
+             'MaxAlignFrac', 'HqDelayTime', 'ISrealign', 'MaxRealignIS', 'UseAnchorWithIS', 'AnchorMagInd', 'SkipCorrelations',
+             'SkipRecReblanks', 'ForFullMontage', 'FullMontStageX', 'FullMontStageY', 'RefCount', 'NavID', 'Reusability',
+             'FileOptions', 'Mode', 'Typext', 'MaxSec', 'UseMdoc', 'MontageInMdoc', 'PctTruncLo', 'PctTruncHi', 'UnsignOpt',
+             'SignToUnsignOpt', 'FileType', 'Compression', 'HdfCompression', 'JpegQuality', 'TIFFallowed', 'SeparateForMont',
+             'MontUseMdoc', 'LeaveExistingMdoc', 'MontFileType',
+             )
 
 REQUIRED_MAPITEM = ('StageXYZ', 'MapFile', 'MapSection',
                     'MapBinning', 'MapMagInd', 'MapScaleMat',
@@ -322,8 +334,7 @@ def stitch_map_items(items: list,
 
 
 def item_to_string(d: dict, tag: str):
-    """Turn a SerialEM key/values dictionary into a .mdoc/.nav formatted
-    string."""
+    """Turn a SerialEM key/values dictionary into a .mdoc/.nav formatted string."""
     s = f'[Item = {tag}]\n'
 
     for key in sorted(d.keys()):
@@ -377,6 +388,30 @@ class NavItem:
             NavItem.TAG_ID_ITERATOR += 1
 
         self.tag = tag
+
+    def print_attributes(self):
+        """Print all attributes in a formatted way."""
+        # 使用 to_dict() 来避免打印内部的私有属性，例如 _keys
+        # 使用 item.to_dict() 获取干净的键值对字典
+        data_dict = self.to_dict()
+
+        # 1. 格式化每个键值对为 "Key=Value" 形式
+        # 确保值被转换为字符串，以便 join 操作成功
+        key_value_pairs = []
+        for key, value in data_dict.items():
+            # 对于列表类型的值 (如 StageXYZ, PtsX)，将其元素用空格连接
+            if isinstance(value, list) or isinstance(value, tuple):
+                value_str = ' '.join(map(str, value))
+            else:
+                value_str = str(value)
+            key_value_pairs.append(f"{key}={value_str}")
+
+        # 2. 连接所有键值对
+        key_value_string = ', '.join(key_value_pairs)
+
+        # 3. 添加 Item 标签和种类信息作为前缀
+        output_line = f"[{self.tag}]: {key_value_string}"
+        print(output_line)
 
     def __repr__(self):
         return f'{self.__class__.__name__}({self.kind}[Item = {self.tag}])'
@@ -737,8 +772,8 @@ def block2dict(block: list, kind: str = None, sequence: int = -1) -> dict:
                 value = [float(val) for val in value.split()]
             elif key in INTEGER_LIST:
                 value = [int(val) for val in value.split()]
-            elif key in UNDEFINED:
-                print(item)
+            elif key in PASSED_TAG:
+                pass
             else:
                 print('Unknown item:', item)
         except Exception as e:
@@ -758,9 +793,9 @@ def block2dict(block: list, kind: str = None, sequence: int = -1) -> dict:
 
 
 def block2nav(block: list, tag: str = None, data_drc: str = None) -> 'NavItem':
-    """Takes a text block from a SerialEM .nav file and converts it into a
-    instance of `NavItem` or `MapItem`"""
+    """Takes a text block from a SerialEM .nav file and converts it into an instance of `NavItem` or `MapItem`"""
     d = block2dict(block)
+    # ret = NavItem(d, tag=tag)
     kind = d['Type']
 
     if kind == 2:
@@ -772,8 +807,7 @@ def block2nav(block: list, tag: str = None, data_drc: str = None) -> 'NavItem':
 
 
 def read_nav_file(fn: str, acquire_only: bool = False) -> list:
-    """Reads a SerialEM .nav file and returns a list of dictionaries containing
-    nav item data.
+    """Reads a SerialEM .nav file and returns a list of dictionaries containing nav item data.
 
     acquire_only: bool
         read only files with the Acquire tag set
@@ -800,6 +834,9 @@ def read_nav_file(fn: str, acquire_only: bool = False) -> list:
             if block:
                 items.append(block2nav(block, tag=tag, data_drc=drc))
 
+            # for debug
+            # if int(line.split("=")[1].strip()[:-1]) == 23:
+            #     point2map = True
             # prep for next block
             tag = m.groups()[0]
             block = []
@@ -810,6 +847,8 @@ def read_nav_file(fn: str, acquire_only: bool = False) -> list:
             if line.startswith('AdocVersion'):
                 pass
             elif line.startswith('LastSavedAs'):
+                pass
+            elif line.startswith('LastUsedHoleISVecs'):
                 pass
             else:
                 print(line)

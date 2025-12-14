@@ -19,6 +19,7 @@ Main components:
 """
 from __future__ import annotations
 import sys
+import threading
 import time
 import warnings
 from queue import Queue, Empty
@@ -37,10 +38,24 @@ from ultralytics import YOLO
 from src.utils.data_models import Montage, Tile, Detection, STATUS_COLORS
 from src.utils.pp_io import load_nav_and_montages, ensure_project_dirs, write_detections, read_detections, \
     add_predictions_to_nav, TILE_NAME_TEMPLATE, PRED_NAME_TEMPLATE, append_to_manual_list, read_manual_list, match_name, \
-    _TILE_RE, remove_from_manual_list, _PRED_RE, read_mdoc_spacing
+    _TILE_RE, remove_from_manual_list, _PRED_RE, update_montage_if_map_generated, check_overlap, \
+    collect_and_map_points_for_montage, deduplicate_global_points, preview_nav_montages
+from src.utils.row_reorder_table import RowReorderTable
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+default_brightness = 100
+
+
+def get_resource_path(relative_path: str) -> Path:
+    """兼容 PyInstaller 打包与源码运行"""
+    if hasattr(sys, "_MEIPASS"):  # 运行在 PyInstaller 打包环境
+        base_path = Path(sys._MEIPASS)
+    else:
+        base_path = Path(__file__).resolve().parent.parent  # src 的上级目录
+
+    return (base_path / relative_path).resolve()
+
 
 # -----------------------------
 # Filesystem Watcher
@@ -48,22 +63,24 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 class MontageWatcher(FileSystemEventHandler):
     """Monitors directory for new stable MRC files and triggers processing."""
 
-    def __init__(self, monitored_path: Path, ui_queue: Queue, job_queue: Queue, montages: Dict[str, Montage]):
+    def __init__(self, nav_path: Path, ui_queue: Queue, job_queue: Queue, montages: Dict[str, Montage]):
         super().__init__()
-        self.monitored_path = monitored_path
+        self.nav_path = nav_path
         self.ui_queue = ui_queue
         self.job_queue = job_queue
         self.montages = montages
         self.processed_files = set()                        # 记录已处理的文件，避免重复处理
-        self._scan_existing_files()
+        # self._scan_existing_files()  直接使用会导致在主线程运行，使得UI卡死，job_queue后台疯狂运行
 
-    def _scan_existing_files(self):
-        """启动监控前扫描已有的文件并处理"""
-        mont = self.montages
-        for p in self.monitored_path.glob("*"):
-            p = p.resolve()
-            if p not in self.processed_files and self._is_file_stable(p, check_interval=0):
+    def scan_existing_files_async(self):
+        """专门提供一个方法，供外部在独立线程中调用"""
+        logger.info(f"Starting initial scan for existing files in {self.nav_path.parent}...")
+        candidate_files = sorted(p.resolve() for p in self.nav_path.parent.glob("*") if p.is_file())
+        for p in candidate_files:
+            if p not in self.processed_files and self._is_file_stable(p, check_interval=0.5):
+                # 如果文件稳定，则提交到处理队列
                 self._process_mrc_file(p)
+        logger.info("Initial scan finished.")
 
     def _is_file_stable(self, file_path: Path, check_interval: float = 5.0) -> bool:
         """检查文件是否稳定（不再被修改）"""
@@ -75,7 +92,7 @@ class MontageWatcher(FileSystemEventHandler):
             current_size = file_path.stat().st_size
             return initial_size == current_size and initial_size > 0
         except (OSError, IOError):
-            logger.debug(f"Montage monitoring failed: {file_path}")
+            logger.error(f"Montage monitoring failed: {file_path}")
             return False
 
     def _process_mrc_file(self, file_path: Path):
@@ -84,14 +101,24 @@ class MontageWatcher(FileSystemEventHandler):
         if not mont:
             return
 
-        if mont.status == "not generated":
+        if mont.status == "to be validated":
             mont.status = "queuing"
             mont.map_file = file_path
             self.ui_queue.put(("update_montage_status", (mont, None)))
             self.job_queue.put(mont)
-            self.processed_files.add(file_path.resolve())
-        elif mont.status == "processed":
-            self.processed_files.add(file_path.resolve())       # 标记为已处理
+        elif mont.status == "to be shot":
+            info = update_montage_if_map_generated(self.nav_path, mont)
+            if info == "Updated":
+                mont.status = "queuing"
+                self.ui_queue.put(("update_montage_status", (mont, None)))
+                self.job_queue.put(mont)
+            else:
+                mont.status = "error"
+                self.ui_queue.put(("update_montage_status", (mont, None)))
+                logger.error(f"Updated {mont.name} failed: {info}")
+        # elif "processed" or "excluded" or "error":
+
+        self.processed_files.add(file_path.resolve())       # 标记为已处理
 
     def on_created(self, event):
         p = Path(event.src_path).resolve()
@@ -243,162 +270,14 @@ class MontageProcessor(QtCore.QThread):
                     self.ui_queue.put(("add_tile_item", (montage, msg)))
 
             # 4. Deduplication Logic
-            removed_num = self._deduplicate_montage(montage, preds_dir)
+            kept_num, removed_num = self._deduplicate_montage(montage, preds_dir)
             montage.status = "processed"
-            msg = f"For {montage.name}: removed {removed_num} points for collision."
+            msg = f"For {montage.name}: removed {removed_num} points for collision, kept {kept_num} points."
             logger.info(msg)
             self.ui_queue.put(("update_montage_status", (montage, msg)))
         except Exception as e:
             logger.error(f"Error reading MRC {montage.map_file}: {e}")
             raise e
-
-    def _find_center_point(self, img: np.ndarray, existing_dets: List[Detection]) -> Optional[Detection]:
-        """
-        Algorithm to find a suitable carbon film spot in the center 1/4th area.
-        Constraints: No overlap with YOLO boxes, pixels not close to 0 or 255, darker than surroundings.
-        """
-        h, w = img.shape
-        box_size = int(self.cfg["box_size"])
-        # Define Center 1/4th area (1/2 width * 1/2 height centered)
-        x_start, x_end = int(1 * w / 4), int(3 * w / 4)
-        y_start, y_end = int(1 * h / 4), int(3 * h / 4)
-
-        # Heuristic: Search this area with a stride
-        stride = max(32, box_size // 4)
-        candidates = []
-        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
-        global_mean = np.mean(img)
-        for y in range(y_start, y_end - box_size, stride):
-            for x in range(x_start, x_end - box_size, stride):
-                # Crop the potential box area
-                roi = img[y: y + box_size, x: x + box_size]
-                # Check 1: Pixel value extremes (Ice vs Vacuum)
-                # "Not too close to 0 (ice), not too close to 255 (vacuum)"
-                if np.min(roi) < 24 or np.max(roi) > 240:
-                    continue
-                mean_val = np.mean(roi)
-                # Check 2: Darker than surroundings (Carbon is darker than ice/vacuum usually in normalized)
-                if mean_val > global_mean * 0.75:
-                    continue
-                # Check 3: Overlap with existing YOLO boxes  光束直径1.6um，约4个box
-                cx, cy = x + box_size * 2, y + box_size * 2
-                if self._check_overlap(cx, cy, box_size * 4, existing_dets):
-                    continue
-                candidates.append((mean_val, cx, cy))
-        if not candidates:
-            return None
-
-        candidates.sort(key=lambda c: c[0])
-        best = candidates[0]
-        return Detection(cls=0, x=best[1], y=best[2], w=float(box_size), h=float(box_size), conf=2.0, status="active")  # conf 2.0 indicates generated point
-
-    def _find_center_point_kmeans(self, img: np.ndarray, existing_dets: List[Detection]) -> Optional[Detection]:
-        """
-        Robust Center Finder using K-Means Clustering and Distance Transform.
-        1. Downsample and K-Means cluster into classes.
-        2. Isolate the Darker class (Carbon).
-        3. Erode to remove noise and shrink away from edges/holes.
-        4. Use Distance Transform to find the 'safest' point (furthest from boundaries).
-        5. Verify no overlap with existing YOLO boxes.
-        """
-        h, w = img.shape
-        box_size = self.cfg["box_size"]
-        # 1. Downsample for speed
-        scale_factor = 512.0 / max(h, w)
-        if scale_factor < 1.0:
-            small_img = cv2.resize(img, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
-        else:
-            small_img = img.copy()
-            scale_factor = 1.0
-
-        # --- Preprocessing---
-        # A. Denoise: Use GaussianBlur to suppress high-frequency noise so K-Means clusters regions, not pixels.
-        # A kernel size of (5, 5) or (7, 7) is effective for typical EM images.
-        small_img = cv2.GaussianBlur(small_img, (3, 3), 0)
-        # B. Contrast Enhancement: Normalize to full 0-255 range to help separate clusters.
-        small_img = cv2.normalize(small_img, None, 0, 255, cv2.NORM_MINMAX)
-        # C. 排除亮度过低或过高的区域
-        intensity_mask = cv2.inRange(small_img, 32, 224)
-
-        # 2. KMeans
-        # Reshape to 1D array of float32
-        pixel_values = small_img.reshape((-1, 1)).astype(np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
-        K = 3
-        # cv2.kmeans returns: compactionness, labels, centers
-        _, labels, centers = cv2.kmeans(pixel_values, K, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
-
-        # Sort centers to identify classes: 0=Dark (Ice/Carbon), 1=Bright (Spot/Holes)
-        centers = centers.flatten()
-        sorted_indices = np.argsort(centers)
-        carbon_label_idx = sorted_indices[1]
-
-        # Create binary mask for Carbon
-        labels = labels.reshape(small_img.shape)
-        mask = (labels == carbon_label_idx).astype(np.uint8) * 255
-
-        # 3. Morphology cleaning
-        # Open operation to remove small noise
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        # Erode to shrink regions (stay away from transition zones)
-        mask = cv2.erode(mask, kernel, iterations=2)
-
-        # 4. Find valid area near center
-        # We prefer points closer to the image center.
-        # Create a "Center Preference" map (Distance from center of image)
-        sh, sw = small_img.shape
-        center_x_small, center_y_small = sw // 2, sh // 2
-        # Only look at the mask area. If mask is empty, fallback.
-        if cv2.countNonZero(mask) == 0:
-            return None
-
-        # Distance Transform: value is distance to nearest zero pixel (boundary)
-        # High value = safely inside a carbon region
-        dist_transform = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-
-        # --- Mask out everything except central 1/4 area ---
-        roi_mask = np.zeros_like(dist_transform, dtype=np.uint8)
-        roi_x1, roi_x2 = int(sw * 0.25), int(sw * 0.75)
-        roi_y1, roi_y2 = int(sh * 0.25), int(sh * 0.75)
-        roi_mask[roi_y1:roi_y2, roi_x1:roi_x2] = 1
-        final_mask = cv2.bitwise_and(intensity_mask, roi_mask)
-        # Apply ROI mask to distance transform (zero out values outside)
-        dist_transform = dist_transform * final_mask
-
-        # Get coordinates of all non-zero points in dist_transform
-        ys, xs = np.nonzero(dist_transform > (box_size * scale_factor * 0.2))  # At least some buffer
-        if len(xs) == 0:
-            return None
-
-        candidates = []
-        for x, y in zip(xs, ys):
-            # Safe distance score
-            d_boundary = dist_transform[y, x]
-            # Centrality score (negative distance to center)
-            d_center = -((x - center_x_small) ** 2 + (y - center_y_small) ** 2) ** 0.5
-            # Combine scores.
-            score = d_boundary * 1 + d_center * 1
-            candidates.append((score, x, y))
-        # Sort by score descending
-        candidates.sort(key=lambda item: item[0], reverse=True)
-
-        # 5. Check overlap with existing boxes
-        final_cx, final_cy = None, None
-
-        # Optimization: Check top candidates
-        for _, cx_small, cy_small in candidates[:50]:
-            # Convert back to original scale
-            cx_orig = cx_small / scale_factor
-            cy_orig = cy_small / scale_factor
-
-            if not self._check_overlap(cx_orig, cy_orig, box_size * 4, existing_dets):
-                final_cx, final_cy = cx_orig, cy_orig
-                break
-
-        if final_cx is not None:
-            return Detection(cls=0, x=final_cx, y=final_cy, w=float(box_size), h=float(box_size), conf=2.0, status="active")
-        return None
 
     def _find_center_point_fft(self, img: np.ndarray, existing_dets: List[Detection]) -> Optional[Detection]:
         """
@@ -503,7 +382,7 @@ class MontageProcessor(QtCore.QThread):
         for _, cx_small, cy_small in candidates[:50]:
             cx_orig = cx_small / scale_factor
             cy_orig = cy_small / scale_factor
-            if not self._check_overlap(cx_orig, cy_orig, box_size * 4, existing_dets):
+            if not check_overlap(cx_orig, cy_orig, box_size * 4, existing_dets):
                 half_box = int(box_size * scale_factor // 2)
                 x1 = max(0, int(cx_small) - half_box)
                 y1 = max(0, int(cy_small) - half_box)
@@ -527,107 +406,41 @@ class MontageProcessor(QtCore.QThread):
 
         return None
 
-    def _deduplicate_montage(self, montage: Montage, preds_dir: Path) -> int:
-        """
-        Detects and removes duplicate detections in overlapping regions between tiles.
-        1. Reads PieceSpacing from .mdoc file.
-        2. Maps all detections to global montage coordinates based on Y-first then X layout.
-        3. Checks for collisions
-        4. Keeps high confidence.
-        Returns the number of removed detections.
+    def _deduplicate_montage(self, montage: Montage, preds_dir: Path) -> Tuple[int, int]:
+        """Detects and removes duplicate detections in overlapping regions between tiles. Returns the number of removed detections.
         """
         # 1. Get PieceSpacing
         nav_folder = self.cfg["nav_path"].parent
-        mdoc_path = nav_folder / f"{montage.map_file.name}.mdoc"
-        spacing_x, spacing_y = read_mdoc_spacing(mdoc_path)
-        if spacing_x == 0 or spacing_y == 0:
-            logger.error(f"Could not read valid PieceSpacing from {mdoc_path}. Skipping deduplication.")
-            return 0
-
-        nx, ny = montage.map_frames  # nx=columns, ny=rows
         box_size = self.cfg["box_size"]
 
-        # 2. Load all detections for this montage into memory
-        all_points = []  # list of {'global_x', 'global_y', 'conf', 'tile_z', 'local_idx', 'det_obj'}
-        tile_dets_map = {}  # z -> list of Detections
-        for z in range(nx * ny):
-            pred_name = PRED_NAME_TEMPLATE.format(montage=montage.map_file.stem, z=z)
-            p_path = preds_dir / pred_name
-            dets = read_detections(p_path)
-            tile_dets_map[z] = dets
+        all_points, tile_dets_map = collect_and_map_points_for_montage(montage.map_file.name, montage.map_frames, preds_dir, nav_folder)
+        if not all_points:
+            logger.debug(f"Skipped deduplication for {montage.map_file}.")
+            return 0, 0
 
-            # First along Y axis (row changes fastest), then along X axis (col changes slowest).
-            # z=0 -> row=0, col=0
-            # z=1 -> row=1, col=0 (Y increases)
-            # ...
-            # z=ny -> row=0, col=1 (X increases, Y resets)
-            col = z // ny  # X index
-            row = z % ny  # Y index
-            offset_x = col * spacing_x
-            offset_y = row * spacing_y
+        # 2. 找到重复项
+        final_points, removals = deduplicate_global_points(all_points, box_size)
 
-            for i, d in enumerate(dets):
-                gx = offset_x + d.x
-                gy = offset_y + d.y
-                all_points.append({'gx': gx, 'gy': gy, 'conf': d.conf, 'z': z, 'local_idx': i, 'det': d})
-
-        # 3. Detect Collisions
-        removals = set()  # Set of (z, local_idx) to remove
-        for i in range(len(all_points)):
-            p1 = all_points[i]
-            # If p1 is already marked for removal, it shouldn't suppress others
-            if (p1['z'], p1['local_idx']) in removals:
-                continue
-            for j in range(i + 1, len(all_points)):
-                p2 = all_points[j]
-                # If p2 is already removed, skip it
-                if (p2['z'], p2['local_idx']) in removals:
-                    continue
-
-                tmp_det = [Detection(cls=0, x=p2['gx'], y=p2['gy'], w=box_size, h=box_size, conf=p2['conf'], status="active")]
-                if self._check_overlap(p1['gx'], p1['gy'], box_size, tmp_det):
-                    if p1['conf'] < p2['conf']:
-                        removals.add((p1['z'], p1['local_idx']))
-                        # Since p1 is now removed, it cannot eliminate any further p3, so we break p1's loop
-                        break
-                    else:
-                        # p2 is removed, but p1 should still compare with others
-                        removals.add((p2['z'], p2['local_idx']))
-
-        # 4. Apply Removals
+        # 3. 应用移除结果到内存和磁盘 (此部分仍由 Worker 负责)
         if removals:
+            # 标记 detections 在 in-memory map 中为 "deleted"
             for (z, idx) in removals:
                 tile_dets_map[z][idx].status = "deleted"
 
+            nx, ny = montage.map_frames
             for z in range(nx * ny):
+                # 应用更改到磁盘 (写入过滤后的 valid_dets)
                 pred_name = PRED_NAME_TEMPLATE.format(montage=montage.map_file.stem, z=z)
                 p_path = preds_dir / pred_name
-
-                # Filter out deleted ones
+                # 筛选出未被删除的点
                 valid_dets = [d for d in tile_dets_map[z] if d.status != "deleted"]
+                if len(valid_dets) == 1 and valid_dets[0].conf > 1.0:  # this only one might be the tracking point
+                    valid_dets = []
                 write_detections(p_path, valid_dets)
-
-                # Update memory in montage object
+                # 更新内存中的 montage 对象
                 tile_name = TILE_NAME_TEMPLATE.format(montage=montage.map_file.stem, z=z)
                 montage.tiles[tile_name].detections = valid_dets
-
-        return len(removals)
-
-    @staticmethod
-    def _check_overlap(cx, cy, size, dets) -> bool:
-        r1_x1, r1_y1 = cx - size / 2, cy - size / 2  # 左上角
-        r1_x2, r1_y2 = cx + size / 2, cy + size / 2  # 右下角
-
-        for d in dets:
-            r2_x1, r2_y1 = d.x - d.w / 2, d.y - d.h / 2
-            r2_x2, r2_y2 = d.x + d.w / 2, d.y + d.h / 2
-
-            # Intersection
-            dx = min(r1_x2, r2_x2) - max(r1_x1, r2_x1)
-            dy = min(r1_y2, r2_y2) - max(r1_y1, r2_y1)
-            if dx > 0 and dy > 0:
-                return True
-        return False
+        return len(final_points), len(removals)
 
 
 # -----------------------------
@@ -637,10 +450,10 @@ class SettingsPanel(QtWidgets.QWidget):
     """Configuration panel for paths and detection parameters."""
 
     # 定义自定义信号 - Qt框架中组件间通信的核心机制
-    # settings_changed = QtCore.pyqtSignal(dict)        # 当运行时，任何设置改变时发射
     start_requested = QtCore.pyqtSignal(dict)           # 点击 RUN 时发射
     stop_requested = QtCore.pyqtSignal()                # 点击 STOP 时发射
     export_requested = QtCore.pyqtSignal(dict)          # 点击export时发射
+    nav_changed = QtCore.pyqtSignal(Path)  # 当 nav 路径变为一个有效 .nav 文件时发射
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -663,18 +476,7 @@ class SettingsPanel(QtWidgets.QWidget):
                 return gpus
         except ImportError as e:
             logger.debug(f"GPU detection failed: {e}")
-
         return gpus
-
-    @staticmethod
-    def get_resource_path(relative_path: str) -> Path:
-        """兼容 PyInstaller 打包与源码运行"""
-        if hasattr(sys, "_MEIPASS"):                            # 运行在 PyInstaller 打包环境
-            base_path = Path(sys._MEIPASS)
-        else:
-            base_path = Path(__file__).resolve().parent.parent  # src 的上级目录
-
-        return (base_path / relative_path).resolve()
 
     def _build_ui(self):
         """UI构建: project_name, model_path, nav_path, box_size, max_detection, conf, iou, device_combo"""
@@ -687,7 +489,7 @@ class SettingsPanel(QtWidgets.QWidget):
 
         # Model line with Browse
         self.model_path = QtWidgets.QLineEdit()         # 模型文件路径文本输入框
-        default_model = self.get_resource_path("data/md2_pm2_best.pt")
+        default_model = get_resource_path("data/md2_pm2_best.pt")
         self.model_path.setText(str(default_model))
         self.model_path_btn = QtWidgets.QPushButton("Browse")
 
@@ -698,8 +500,8 @@ class SettingsPanel(QtWidgets.QWidget):
 
         # Nav line with Browse
         self.nav_path = QtWidgets.QLineEdit()            # 导航文件路径文本输入框
-        # default_nav = self.get_resource_path("test/nav001.nav")         # for test
-        # self.nav_path.setText(str(default_nav))
+        default_nav = get_resource_path("test/1211_nav001.nav")         # for test
+        self.nav_path.setText(str(default_nav))
         self.nav_path_btn = QtWidgets.QPushButton("Browse")
 
         nav_h = QtWidgets.QHBoxLayout()
@@ -748,9 +550,9 @@ class SettingsPanel(QtWidgets.QWidget):
         layout.addRow("Device:", self.device_combo)
 
         self.overwrite = QtWidgets.QCheckBox("Overwrite")
-        self.run_btn = QtWidgets.QPushButton("RUN")
+        self.run_btn = QtWidgets.QPushButton("Process Selected")
         self.stop_btn = QtWidgets.QPushButton("STOP")
-        self.export_btn = QtWidgets.QPushButton("Export")
+        self.export_btn = QtWidgets.QPushButton("Export Selected")
         self.stop_btn.setEnabled(False)                     # Stop initially disabled; enabled once running 
         btn_h = QtWidgets.QHBoxLayout()
         btn_h.addWidget(self.overwrite)
@@ -762,9 +564,26 @@ class SettingsPanel(QtWidgets.QWidget):
         # 连接按钮事件
         self.model_path_btn.clicked.connect(self.on_browse_model)
         self.nav_path_btn.clicked.connect(self.on_browse_nav)
+        # 当用户用 Browse 选择文件或手工输入并完成（editingFinished）时，触发读取 nav 的逻辑
+        self.nav_path.editingFinished.connect(self.on_nav_path_set)
         self.run_btn.clicked.connect(self.on_run)
         self.stop_btn.clicked.connect(self.on_stop)
         self.export_btn.clicked.connect(self.on_export)
+
+    def set_inputs_enabled(self, enabled: bool):
+        """Enable or disable all configuration inputs."""
+        self.project_name.setEnabled(enabled)
+        self.model_path.setEnabled(enabled)
+        self.model_path_btn.setEnabled(enabled)
+        self.nav_path.setEnabled(enabled)
+        self.nav_path_btn.setEnabled(enabled)
+        self.img_size.setEnabled(enabled)
+        self.box_size.setEnabled(enabled)
+        self.max_detection.setEnabled(enabled)
+        self.conf.setEnabled(enabled)
+        self.iou.setEnabled(enabled)
+        self.device_combo.setEnabled(enabled)
+        self.overwrite.setEnabled(enabled)
 
     def on_browse_model(self):
         f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select model file", filter="*.pt *.yaml *.pth")
@@ -775,6 +594,18 @@ class SettingsPanel(QtWidgets.QWidget):
         f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select nav file", filter="*.nav")
         if f:
             self.nav_path.setText(f)
+            # 立即触发 nav 设置处理（等同于用户完成手工输入）
+            self.on_nav_path_set()
+
+    def on_nav_path_set(self):
+        """当 nav_path 输入完成（editingFinished 或 Browse 后）调用。仅在文件名以 .nav 结尾且文件存在时发出 nav_changed(Path) 信号。"""
+        txt = self.nav_path.text().strip()
+        if not txt:
+            return
+        p = Path(txt)
+        if p.suffix == ".nav" and p.exists():
+            self.nav_changed.emit(p)
+        # 非 .nav 文件或者不存在，不触发读取，保持静默。
 
     def _validate_cfg(self):
         cfg = {
@@ -814,17 +645,20 @@ class SettingsPanel(QtWidgets.QWidget):
             self.start_requested.emit(cfg)
             self.run_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
+            self.set_inputs_enabled(False)  # Disable inputs
 
     def on_stop(self):
         self.stop_requested.emit()
         self.stop_btn.setEnabled(False)
         self.run_btn.setEnabled(True)
+        self.set_inputs_enabled(True)  # Re-enable inputs
 
     def on_export(self):
         """发射export请求"""
         cfg = {
             "project_name": self.project_name.text().strip(),
             "nav_path": Path(self.nav_path.text().strip()) if self.nav_path.text().strip() else None,
+            "box_size": self.box_size.value()
         }
 
         if not (cfg["project_name"] and cfg["nav_path"]):
@@ -848,17 +682,36 @@ class StatusPanel(QtWidgets.QWidget):
 
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-
-        # 创建表格部件，设置2列：名称和状态
-        self.table_widget = QtWidgets.QTableWidget(0, 2)                                # 2列：名称和状态
-        self.table_widget.setHorizontalHeaderLabels(["Montage Name", "Status"])         # 设置列标题
-        # 设置表格属性
+        # 创建表格部件，设置3列：名称、状态、复选（右侧）
+        # self.table_widget = QtWidgets.QTableWidget(0, 3)  # 改为3列
+        self.table_widget = RowReorderTable(0, 3)
+        self.table_widget.setHorizontalHeaderLabels(["Montage Name", "Status", "Selected"])
         self.table_widget.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)  # 第一列拉伸
         self.table_widget.setColumnWidth(1, 160)
+        self.table_widget.setColumnWidth(2, 80)
         self.table_widget.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)  # 整行选择
+        self.table_widget.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)  # 只能选一行
         self.table_widget.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)   # 不可编辑
         self.table_widget.itemSelectionChanged.connect(self.on_selection_changed)
+        self.table_widget.rowsReordered.connect(self._on_rows_reordered)
         layout.addWidget(self.table_widget)
+
+    def _on_rows_reordered(self, rows: list):
+        """
+        在用户通过拖动改变行顺序后调用：根据表格中第一列（name）的顺序，
+        重新构建 self.montages（保持原有 Montage 对象、不复制）。
+        """
+        # 备份旧映射，按新顺序重建字典（保留 Montage 对象）
+        old = self.montages
+        new = {}
+        for name in rows:
+            if name in old:
+                new[name] = old[name]
+        # 如果有旧字典中存在但表格中未出现的项，也追加到末尾
+        for k, v in old.items():
+            if k not in new:
+                new[k] = v
+        self.refresh(new, True)
 
     def on_selection_changed(self):
         """处理表格选择变化"""
@@ -867,10 +720,11 @@ class StatusPanel(QtWidgets.QWidget):
             name = selected_items[0].text()                                 # 第一列是名称
             self.montage_selected.emit(name)
 
-    def refresh(self,montages: Dict[str, Montage]):
+    def refresh(self, montages: Dict[str, Montage], delete_previous: bool):
         """刷新表格显示"""
         self.montages = montages
-        self.table_widget.setRowCount(0)                                    # 清空所有行
+        if delete_previous:
+            self.table_widget.setRowCount(0)                                    # 清空所有行
         for m in self.montages.values():
             self.update_montage(m)
 
@@ -892,6 +746,53 @@ class StatusPanel(QtWidgets.QWidget):
         stat_item.setBackground(color)
         self.table_widget.setItem(row, 0, name_item)
         self.table_widget.setItem(row, 1, stat_item)
+
+        # 保留已有 checkbox 状态（如果存在），否则创建并默认勾选
+        existing_widget = self.table_widget.cellWidget(row, 2)
+        if existing_widget is None:
+            chk = QtWidgets.QCheckBox()
+            chk.setChecked(True)
+            chk.setTristate(False)
+            # 居中显示
+            w = QtWidgets.QWidget()
+            hl = QtWidgets.QHBoxLayout(w)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setAlignment(QtCore.Qt.AlignCenter)
+            hl.addWidget(chk)
+            self.table_widget.setCellWidget(row, 2, w)
+
+    def get_checked_montages(self) -> List[str]:
+        """返回当前表格中被勾选的 montage 名称列表（按行检查第 2 列的 checkbox）。"""
+        res = []
+        for row in range(self.table_widget.rowCount()):
+            cell_w = self.table_widget.cellWidget(row, 2)
+            if cell_w is None:
+                continue
+            # wrapper widget -> layout -> checkbox
+            cb = None
+            # attempt to find QCheckBox inside wrapper
+            for i in range(cell_w.layout().count()):
+                w = cell_w.layout().itemAt(i).widget()
+                if isinstance(w, QtWidgets.QCheckBox):
+                    cb = w
+                    break
+            if cb and cb.isChecked():
+                name_it = self.table_widget.item(row, 0)
+                if name_it:
+                    res.append(name_it.text())
+        return res
+
+    def set_selection_enabled(self, enabled: bool):
+        """启用/禁用复选框交互。"""
+        for row in range(self.table_widget.rowCount()):
+            cell_w = self.table_widget.cellWidget(row, 2)
+            if cell_w:
+                # cell_w is a container widget, layout inside has the checkbox
+                layout = cell_w.layout()
+                for i in range(layout.count()):
+                    w = layout.itemAt(i).widget()
+                    if isinstance(w, QtWidgets.QCheckBox):
+                        w.setEnabled(enabled)
 
 
 class ViewerPanel(QtWidgets.QWidget):
@@ -1102,8 +1003,7 @@ class ViewerPanel(QtWidgets.QWidget):
         if not self._auto_brightness_done:
             mean_val = np.mean(self.base_image)
             if mean_val > 1:  # Avoid division by zero
-                target = 128.0
-                factor = target / mean_val
+                factor = default_brightness / mean_val
                 # Clamp factor to slider range 0.4 - 4.0
                 factor = max(0.4, min(factor, 4.0))
                 # Update internal brightness and Slider UI
@@ -1150,17 +1050,15 @@ class ViewerPanel(QtWidgets.QWidget):
                 w = int(det.w * self.display_scale)
                 h = int(det.h * self.display_scale)
 
-                painter.setPen(QtCore.Qt.white)
-                painter.drawText(x0, y0 - 6, f"conf: {det.conf:.2f}")  # Draw Conf (Top-Left)
-                if first:
-                    first = False
-                    painter.drawText(x0, y0 + h + 11, f"1st point for tracking")
-
                 color_name = STATUS_COLORS.get("active")
                 if self.selected_det and det == self.selected_det:
                     color_name = STATUS_COLORS.get("processing")
                 painter.setPen(QtGui.QPen(QtGui.QColor(color_name), 2))
                 painter.drawRect(x0, y0, w, h)
+                painter.drawText(x0, y0 - 6, f"conf: {det.conf:.2f}")  # Draw Conf (Top-Left)
+                if first:
+                    first = False
+                    painter.drawText(x0, y0 + h + 11, f"1st point for tracking")
 
         painter.end()
         self.canvas_label.setPixmap(canvas_pix)             # 把最终画布放到 label（pixmap 大小等于 label 大小）
@@ -1368,7 +1266,7 @@ class ViewerPanel(QtWidgets.QWidget):
         return img_x, img_y
 
     def eventFilter(self, obj, event):
-        # keyboard navigation and canvas events
+        """keyboard navigation and canvas events"""
         if obj is self.canvas_label:
             # 添加安全检查：如果没有当前tile或没有基础图像，不处理事件
             if self.base_image is None or self.current_montage is None or self.current_tile_name is None:
@@ -1395,59 +1293,60 @@ class ViewerPanel(QtWidgets.QWidget):
                 else:
                     self.display_scale /= 1.15  # 向下滚动 -> 缩小
 
-                # 限制缩放范围在0.1到3.0之间
-                self.display_scale = min(max(self.display_scale, 0.15), 3.0)
-                # 重新渲染当前切片
+                self.display_scale = min(max(self.display_scale, 0.15), 3.0)    # 限制缩放范围在0.1到3.0之间
                 tile = self.current_montage.tiles.get(self.current_tile_name)
-                if tile:
-                    self._render_tile(tile)
+                self._render_tile(tile)
                 return True
 
             if event.type() == QtCore.QEvent.MouseButtonPress:          # 鼠标按下事件
                 pos = event.pos()                                       # 获取鼠标位置
                 tile = self.current_montage.tiles.get(self.current_tile_name)
-                if not tile:
-                    return True
 
-                img_x, img_y = self._screen_to_image_coords(pos)
-                if event.button() == QtCore.Qt.LeftButton:              # 处理左键点击
-                    clicked = None
-                    for det in tile.detections:
-                        if det.x - det.w/2 <= img_x <= det.x + det.w/2 and det.y - det.h/2 <= img_y <= det.y + det.h/2:
-                            clicked = det
-                            break
-                    if clicked:                     # 点击了检测框：选中它
-                        self.selected_det = clicked
-                        self._render_tile(tile)     # 重新渲染以显示选中状态
-                    else:                           # 点击了空白区域
-                        if self.selected_det:       # 有选中框：移动到点击位置
-                            self.move_selected_detection(tile, img_x, img_y)
-                        else:                       # 没有选中框：创建新框
-                            self.add_new_detection(tile, img_x, img_y)
-                    return True
-                elif event.button() == QtCore.Qt.RightButton:           # 处理右键点击 - 取消选择
-                    self.selected_det = None
-                    self._render_tile(tile)  # 重新渲染以更新显示
-                    return True
-                elif event.button() == QtCore.Qt.MiddleButton:          # 处理中键点击 - 启动平移
-                    self._panning = True
+                if event.button() == QtCore.Qt.LeftButton:              # 【左键按下】：初始化平移状态，暂时不执行点击逻辑
+                    self._panning = False                               # 先设为False，只有拖动距离超过阈值才视为平移
                     self._pan_start = pos
-                    self._pan_initial_offset = self.pan_offset  # 记录当前偏移量作为起点
+                    self._pan_initial_offset = self.pan_offset          # 记录当前偏移量作为起点
+                    return True
+                elif event.button() == QtCore.Qt.RightButton:           # 【右键点击】：移动已选中的框到当前位置
+                    if self.selected_det:                               # 有选中框：移动到点击位置
+                        img_x, img_y = self._screen_to_image_coords(pos)
+                        self.move_selected_detection(tile, img_x, img_y)
                     return True
 
-            if event.type() == QtCore.QEvent.MouseMove:              # 鼠标移动：如果在平移模式，更新 pan_offset 并重绘；否则忽略
-                if self._panning:
-                    assert self._pan_start is not None
-                    self.pan_offset = self._pan_initial_offset + (event.pos() - self._pan_start)
-                    tile = self.current_montage.tiles.get(self.current_tile_name)
-                    if tile:
+            if event.type() == QtCore.QEvent.MouseMove:                 # 只有左键按住时才处理平移
+                if event.buttons() & QtCore.Qt.LeftButton:
+                    if self._pan_start:
+                        # 计算移动距离，设置一个小阈值(5像素)防止点击抖动被误判为拖拽
+                        if not self._panning:
+                            dist = (event.pos() - self._pan_start).manhattanLength()
+                            if dist > 5:
+                                self._panning = True
+                        # 如果确认为平移模式，则更新画布
+                        if self._panning:
+                            self.pan_offset = self._pan_initial_offset + (event.pos() - self._pan_start)
+                            tile = self.current_montage.tiles.get(self.current_tile_name)
+                            self._render_tile(tile)
+                    return True
+
+            if event.type() == QtCore.QEvent.MouseButtonRelease:    # 鼠标释放
+                if event.button() == QtCore.Qt.LeftButton:
+                    if self._panning:                               # 如果刚刚是平移操作，释放时只需重置状态
+                        self._panning = False
+                        self._pan_start = None
+                    else:
+                        pos = event.pos()  # 获取鼠标位置
+                        img_x, img_y = self._screen_to_image_coords(pos)
+                        tile = self.current_montage.tiles.get(self.current_tile_name)
+                        clicked = None
+                        for det in tile.detections:                 # 碰撞检测：检查是否点在某个框上
+                            if det.x - det.w / 2 <= img_x <= det.x + det.w / 2 and det.y - det.h / 2 <= img_y <= det.y + det.h / 2:
+                                clicked = det
+                                break
+                        if clicked:                                 # 点击了检测框：选中它
+                            self.selected_det = clicked
+                        else:                                       # 点击了空白区域，新建框
+                            self.add_new_detection(tile, img_x, img_y)
                         self._render_tile(tile)
-                    return True
-
-            if event.type() == QtCore.QEvent.MouseButtonRelease:    # 鼠标释放：结束平移
-                if self._panning:
-                    self._panning = False
-                    self._pan_start = None
                     return True
 
         return super().eventFilter(obj, event)
@@ -1459,7 +1358,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Point Picker")
-        icon = self.get_resource_path("data/pp_gemini.ico")
+        icon = get_resource_path("data/pp_gemini.ico")
         self.setWindowIcon(QtGui.QIcon(str(icon)))
         self.resize(1200, 800)
 
@@ -1489,6 +1388,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.settings.start_requested.connect(self.on_start)                # 设置面板的开始信号连接到处理函数
         self.settings.stop_requested.connect(self.on_stop)
         self.settings.export_requested.connect(self.on_export)
+        self.settings.nav_changed.connect(self.on_nav_set)
         self.status.montage_selected.connect(self.on_montage_selected)      # 状态面板的选择信号
         self.viewer.tile_selected.connect(self.on_tile_selected)  # viewer面板的Manual List的选择tile信号
 
@@ -1499,49 +1399,68 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.timeout.connect(self.process_ui_queue)
         self.timer.start(200)                                               # 启动定时器，每200毫秒触发一次
 
-    @staticmethod
-    def get_resource_path(relative_path: str) -> Path:
-        """兼容 PyInstaller 打包与源码运行"""
-        if hasattr(sys, "_MEIPASS"):                            # 运行在 PyInstaller 打包环境
-            base_path = Path(sys._MEIPASS)
-        else:
-            base_path = Path(__file__).resolve().parent.parent  # src 的上级目录
-
-        return (base_path / relative_path).resolve()
+    def on_nav_set(self, nav_path: Path):
+        """仅用于在未运行时预览并刷新 StatusPanel（不启动 worker）。"""
+        try:
+            project_name = self.settings.project_name.text().strip()
+            if not project_name:
+                self.viewer.log("Empty project name, skipped montages preview.")
+                self.montages = preview_nav_montages(nav_path)
+            else:
+                self.montages = load_nav_and_montages(nav_path, project_name, False)
+                self.viewer.set_dirs(nav_path.parent,{"project_name": project_name, "box_size": self.settings.box_size.value()})
+            self.status.refresh(self.montages, delete_previous=True)
+        except Exception as e:
+            msg = f"Failed to preview {nav_path}: {e}"
+            self.viewer.log(msg)
+            logger.error(msg)
 
     def on_start(self, cfg: dict):
         """Initialize workers and load data."""
         try:
             nav_folder = cfg["nav_path"].parent
             self.montages = load_nav_and_montages(cfg["nav_path"], cfg["project_name"], cfg["overwrite"])
-            self.status.refresh(self.montages)
-            self.viewer.set_dirs(nav_folder, cfg)
+            self.status.refresh(self.montages, delete_previous=False)
 
-            # Watcher
-            if self.observer:
-                self.observer.stop()
-            self.observer = Observer()
-            handler = MontageWatcher(nav_folder, self.ui_queue, self.job_queue, self.montages)
-            self.observer.schedule(handler, str(nav_folder), recursive=False)
-            self.observer.start()
+            self.viewer.set_dirs(nav_folder, cfg)
+            self.status.set_selection_enabled(False)  # 禁用 UI 交互
+
+            for m in self.montages.values():
+                if m.name not in self.status.get_checked_montages():
+                    m.status = "excluded"
+                    self.ui_queue.put(("update_montage_status", (m, None)))
 
             # Processing Worker
             detector = YoLoWrapper(str(cfg["model_path"]))
             self.worker = MontageProcessor(self.ui_queue, self.job_queue, detector, cfg)
-            self.worker.start()         # 启动工作线程，在后台持续监听 job_queue
+            self.worker.start()  # 启动工作线程，在后台持续监听 job_queue
 
-            # Enqueue existing tasks
-            for m in self.montages.values():
-                if m.status == "not generated" and m.map_file.exists():
-                    m.status = "queuing"
-                    self.ui_queue.put(("update_montage_status", (m, None)))
-                    self.job_queue.put(m)
+            if self.observer:
+                self.observer.stop()
+            self.observer = Observer()
+            handler = MontageWatcher(cfg["nav_path"], self.ui_queue, self.job_queue, self.montages)
+            self.observer.schedule(handler, str(nav_folder), recursive=False)
+            self.observer.start()
+
+            # daemon=True 表示如果主程序关闭，这个扫描线程也会自动随之关闭
+            scan_thread = threading.Thread(target=handler.scan_existing_files_async, daemon=True)
+            scan_thread.start()
+
+            msg = f"Processing started. Monitoring directory {nav_folder}..."
+            logger.info(msg)
+            self.viewer.log(msg)
 
         except Exception as e:
             logger.error(f"Startup failed: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
+            # If error occurs, re-enable controls
+            self.settings.on_stop()  # Reset settings buttons
+            self.status.set_selection_enabled(True)
 
     def on_stop(self):
+        # Enable controls in Status Panel
+        self.status.set_selection_enabled(True)
+
         if self.observer:
             self.observer.stop()
             self.observer.join(timeout=2.0)
@@ -1555,7 +1474,8 @@ class MainWindow(QtWidgets.QMainWindow):
         logger.info("Processing stopped.")
 
     def on_export(self, cfg: dict):
-        msg = add_predictions_to_nav(cfg["nav_path"], cfg["project_name"], cfg["save_path"])
+        # reordered export
+        msg = add_predictions_to_nav(cfg["nav_path"], cfg["project_name"], cfg["save_path"], self.status.get_checked_montages(), cfg["box_size"])
         self.viewer.log(msg)
         logger.info(msg)
 

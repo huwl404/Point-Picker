@@ -51,17 +51,19 @@ class Montage:
     map_id: int
     map_file: Path
     map_frames: List[int]
-    status: str = "not generated"  # not generated, not processed, processing, processed, error
+    status: str = "to be validated"  # to be validated, to be shot, queuing, processing, processed, error, excluded
     tiles: Dict[str, Tile] = field(default_factory=dict)  # slice in this montage = tile_name -> tile
 
 
 STATUS_COLORS = {
-    "not generated": "white",
-    "queuing": "cyan",
+    "to be validated": "cyan",
+    "to be shot": "#F4F0F1",  # slight grey
+    "queuing": "#ADE699",  # slight green
     "processing": "yellow",
-    "processed": "lightgreen",
-    "error": "lightcoral",
+    "processed": "#10C378",  # green
+    "error": "#FF773C",  # orange
+    "excluded": "grey",
 
-    "active": "blue",
+    "active": "#7DF9FF",  # electric blue
     "deleted": "red"
 }

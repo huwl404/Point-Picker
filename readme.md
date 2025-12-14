@@ -1,7 +1,7 @@
 # **Point-Picker: SerialEM Annotation Tool**
 
-Point-Picker is a Graphical User Interface (GUI) tool built with Python and PyQt5, designed for the Cryo-EM field. It monitors the navigation map (nav) and montage outputs produced by the SerialEM software, automates YOLO object detection inference, and provides an interactive interface for users to inspect, edit, and export collected coordinate information, ultimately generating navigation files compatible with the SerialEM format.
-> ![img.png](data/img_win11.png)
+Point-Picker is a Graphical User Interface (GUI) tool built with Python and PyQt5, designed for the Cryo-EM field. It monitors the navigator file and montage outputs produced by the SerialEM software, automates YOLO object detection inference, and provides an interactive interface for users to inspect, edit, and export collected coordinate information, ultimately generating navigation files compatible with the SerialEM format.
+> ![img.png](data/img_win11_v0.2.png)
 > *Screenshot of Point-Picker Running on Win11*
 > ![img.png](data/img_linux.png)
 > *Screenshot of Point-Picker Running on Linux*
@@ -25,39 +25,37 @@ The project is structured around the following main GUI panels and background me
      * Splitting the montage image into smaller tiles.  
      * Running the YOLO model on the tiles to perform object detection inference.  
      * Finding coordinate centers and performing deduplication.  
-     * Communicating with the main GUI thread via queue.Queue for real-time status updates.
+     * Communicating with the main GUI thread.
 
 **Core Dependencies:** PyQt5, cv2 (OpenCV), mrcfile, ultralytics (YOLO), watchdog.
 
 ## **🎯 Execution Logic**
 
-Point-Picker's workflow is a professional process combining automation with manual intervention:
-
 1. **Initialization and Monitoring:**  
    * After the program starts, it loads the project parameters set by the user in the Settings Panel.  
    * The background file system listener starts monitoring the SerialEM output directory.  
 2. **Data Ingestion & Pipeline Start:**  
-   * When SerialEM generates new .mrc files, the Watcher triggers an event.  
-   * The Status Panel displays the new Montage and starts the background processing pipeline.  
+   * When SerialEM generates new .mrc and .mdoc files, the Watcher triggers an event.  
+   * The Status Panel updates the montage's information and starts the background processing pipeline for checked items.  
 3. **Processing Pipeline (Background):**  
-   * **Splitting:** The montage image is loaded (using the mrcfile library) and split into tiles.  
+   * **Splitting:** The montage image is loaded and split into tiles.  
    * **Inference:** The ultralytics YOLO model runs on each tile, generating object detection results (bounding boxes and confidence scores).  
    * **Consolidation:** Tile coordinates are remapped back to the original Montage coordinates and deduplicated.  
 4. **User Interaction (Foreground):**  
-   * The user selects a Montage in the Status Panel; the Viewer Panel loads and displays the Montage or Tile.  
-   * The user interacts with the Viewer Panel using mouse operations (e.g., clicking, dragging) to manually inspect, correct, or add prediction boxes, enabling interactive label editing.  
+   * The user selects a Montage in the Status Panel; the Viewer Panel loads and displays the Tile.  
+   * The user interacts with the Viewer Panel using mouse operations (e.g., clicking, dragging) to manually inspect, correct, or add prediction boxes.  
 5. **Data Export:**  
-   * The user performs the export operation in the Settings Panel.  
-   * The program writes all user-corrected or confirmed coordinate data to the specified navigation file in a SerialEM-compatible format, completing the annotation cycle.
+   * The user reorders the montages by dragging each row in the Status Panel and performs the export operation in the Settings Panel.  
+   * The program writes reordered and deduplicated coordinate data to the specified .nav file in a SerialEM-compatible format.
 
 ## **⌨️ Supported Operations**
 
-| Operation                         | Description                                                                                                                                                                                                                                                                                                                                                     | Location                 |
-|:----------------------------------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|:-------------------------|
-| **Set Project Parameters**        | Define input and output, model, and YOLO parameters.                                                                                                                                                                                                                                                                                                            | Settings Panel           |
-| **Start/Stop/Export Predictions** | Initiate or halt the background monitoring and YOLO inference pipeline; and write the final, curated coordinate list back into a SerialEM .nav file.                                                                                                                                                                                                            | Settings Panel           |
-| **View Montage/Tile**             | Select a specific montage or its tile for inspection.                                                                                                                                                                                                                                                                                                           | Status & Viewer Panels   |
-| **Edit Predicted Boxes**          | select nothing + left mousekey => adding a point; <br/>**delete** key/buttons => delete selected point/tile; <br/>select the point + left mousekey => modify the point;<br/>right mousekey => cancel selection;<br/>wheel => zoom in/out/drag the tile;<br/> **S** key/button => save the modification; <br/>apply confidence filter and brightness adjustment. | Viewer Panel (Mouse/Key) |
+| Operation                     | Description                                                                                                                                                                                                                                                                                                                                        |
+|:------------------------------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Set Project Parameters**    | Preview montage information in .nav file; Load previous predictions if possible.                                                                                                                                                                                                                                                                   |
+| **Process/Stop/Export**       | Initiate or stop the background pipeline; Write the reordered and curated coordinate list back into a .nav file.                                                                                                                                                                                                                                   |
+| **Reorder Montage/View Tile** | In Status Panel, left-drag to reorder the exported group sequence; In Status Panel or Viewer Panel, Left-click to select a specific montage or its tile for inspection.                                                                                                                                                                            |
+| **Edit Predicted Boxes**      | left-click empty => create a point; <br/>left-click existing => select a point; <br/>right-click => move selected to clicked position; <br/>left-drag => pan; <br/>wheel => zoom; <br/>delete / Shift+delete => delete selected/tile; <br/> **S** key/button => save current modification; <br/>apply confidence filter and brightness adjustment. |
 
 
 ## **🚀 Installation and Execution**

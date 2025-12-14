@@ -12,8 +12,9 @@ Handles file input/output, regex parsing, and global constants.
 import os
 import re
 import shutil
+from collections import defaultdict
 from pathlib import Path
-from typing import Tuple, Dict, List, Optional, Pattern
+from typing import Tuple, Dict, List, Optional, Pattern, Any, Set
 
 from src.utils.data_models import Detection, Tile, Montage
 from src.utils.nav_io import NavItem, read_nav_file, write_nav_file
@@ -74,12 +75,9 @@ def load_existing_info(nav_folder: Path, project_name: str) -> Dict[str, Dict[st
 
     return mont_tiles
 
-def load_nav_and_montages(nav_path: Path, project_name: str, overwrite: bool) -> Dict[str, Montage]:
-    """Parse .nav file to build Montage objects, optionally loading existing data."""
-    nav_folder = nav_path.parent
-    ensure_project_dirs(nav_folder, project_name)
+def preview_nav_montages(nav_path: Path) -> Dict[str, Montage]:
+    """预览nav文件"""
     montages: Dict[str, Montage] = {}
-
     items = read_nav_file(str(nav_path))
     for it in items:
         type_tag = getattr(it, "Type", None)
@@ -87,10 +85,28 @@ def load_nav_and_montages(nav_path: Path, project_name: str, overwrite: bool) ->
             mapid = getattr(it, "MapID", None)
             mapfile = getattr(it, "MapFile", None)
             mapframes = getattr(it, "MapFramesXY", None)
-            mont = Montage(name=normalize_path(mapfile).name, map_id=mapid, map_file=normalize_path(mapfile), map_frames=mapframes)
-            montages[mont.name] = mont
-        # ignore 0 -> point & 1 -> polygon
+            status = "to be validated"
+        # 0 -> point & 1 -> polygon
+        # there are scripts to define maps from points or polygon, to handle it:
+        elif type_tag == 0 or type_tag == 1:
+            mapfile = getattr(it, "FileToOpen", None)
+            if mapfile is None:  # items without this tag would be omitted
+                continue
+            mapid = getattr(it, "MapID", None)
+            mapframes = [0, 0]  # default, when files are generated, information would be updated
+            status = "to be shot"
+        else:
+            continue
+        mont = Montage(name=normalize_path(mapfile).name, map_id=mapid,
+                       map_file=normalize_path(mapfile), map_frames=mapframes, status=status)
+        montages[mont.name] = mont
+    return montages
 
+def load_nav_and_montages(nav_path: Path, project_name: str, overwrite: bool) -> Dict[str, Montage]:
+    """Parse .nav file to build Montage objects, optionally loading existing data."""
+    montages = preview_nav_montages(nav_path)
+    nav_folder = nav_path.parent
+    ensure_project_dirs(nav_folder, project_name)
     # Load existing state if not overwriting
     if not overwrite:
         existing = load_existing_info(nav_folder, project_name)  # key is montage stem
@@ -103,8 +119,31 @@ def load_nav_and_montages(nav_path: Path, project_name: str, overwrite: bool) ->
         p = nav_folder / project_name / MANUAL_LIST_FILENAME
         if os.path.isfile(p):
             os.remove(p)
-
     return montages
+
+def update_montage_if_map_generated(nav_path: Path, mont: Montage) -> str:
+    """
+    重新读取 nav_path，查找是否存在 Type==2 且 MapFile 对应 mont.map_file 的条目。
+    如果找到，更新 mont 的关键信息并返回 True；否则返回 False。
+    注意：该函数只**更新传入的 montage 对象（就地修改）**，不返回新的对象。
+    """
+    items = read_nav_file(str(nav_path))
+    for it in items:
+        try:
+            if getattr(it, "Type", None) != 2:
+                continue
+            mapfile_raw = getattr(it, "MapFile", None)
+            mapfile_norm = normalize_path(mapfile_raw)
+            if mapfile_norm.name != mont.name:
+                continue
+            # 找到匹配项 -> 更新 montage 字段
+            mont.map_file = mapfile_norm
+            mont.map_id = getattr(it, "MapID", mont.map_id)
+            mont.map_frames = getattr(it, "MapFramesXY", mont.map_frames)
+            return "Updated"
+        except Exception as e:
+            return str(e)
+    return "Not Found."
 
 def read_detections(path: Path) -> List[Detection]:
     """Parse a detection text file into a list of Detection objects."""
@@ -143,94 +182,180 @@ def write_detections(path: Path, dets: List[Detection]):
         for d in dets:
             fh.write(f"{d.cls} {d.x:.2f} {d.y:.2f} {d.w:.2f} {d.h:.2f} {d.conf:.2f} {d.status}\n")
 
-def add_predictions_to_nav(input_nav: Path, project_name: str, output_nav: Path) -> str:
-    """Export valid predictions back into a new .nav file."""
-    # 1) read nav file
-    items = read_nav_file(str(input_nav))
+def check_overlap(cx: float, cy: float, size: float, dets: List[Detection]) -> bool:
+    r1_x1, r1_y1 = cx - size / 2, cy - size / 2  # 左上角
+    r1_x2, r1_y2 = cx + size / 2, cy + size / 2  # 右下角
 
-    # 2) build map lookup by MapFile stem
-    map_lookup = build_map_lookup(items)
-    if not map_lookup:
-        return f"No Map items found in {input_nav}"
+    for d in dets:
+        r2_x1, r2_y1 = d.x - d.w / 2, d.y - d.h / 2
+        r2_x2, r2_y2 = d.x + d.w / 2, d.y + d.h / 2
 
-    images_dir, preds_dir = ensure_project_dirs(input_nav.parent, project_name)
-    # 3) iterate prediction files
-    new_items = []
-    group_counter = 0       # GroupID starts from 1 (per-file group)
-    # set class iterator to continue numbering
-    tag_id= 1
-    for p in sorted(preds_dir.glob("*.txt")):
-        mont, idx = match_name(p.name, _PRED_RE)
-        if idx == -1:
+        # Intersection
+        dx = min(r1_x2, r2_x2) - max(r1_x1, r2_x1)
+        dy = min(r1_y2, r2_y2) - max(r1_y1, r2_y1)
+        if dx > 0 and dy > 0:
+            return True
+    return False
+
+
+def collect_and_map_points_for_montage(montage_name: str, map_frames: List[int], preds_dir: Path, nav_folder: Path)\
+        -> Tuple[List, Dict[int, List[Detection]]]:
+    """
+    收集单个 Montage 的所有 detections，并映射到全局坐标。
+    返回: (全局坐标点列表, z_index -> 局部 detections 列表)
+    """
+    # 1. 获取 PieceSpacing
+    mdoc_path = nav_folder / f"{montage_name}.mdoc"
+    spacing_x, spacing_y = read_mdoc_spacing(mdoc_path)
+    if spacing_x == 0 or spacing_y == 0:
+        return [], {}
+
+    nx, ny = map_frames  # (columns, rows)
+    all_points = []  # list of {'global_x', 'global_y', 'conf', 'mont_name', 'tile_z', 'local_idx', 'det'}
+    tile_dets_map = {}  # z -> list of Detections
+
+    mont_stem = Path(montage_name).stem
+    preds_for_montage = sorted(preds_dir.glob(f"{mont_stem}_tile*.txt"))
+    for p_path in preds_for_montage:
+        mont, z = match_name(p_path.name, _PRED_RE)
+        if z == -1:
             continue
 
-        map_item = map_lookup.get(mont)
+        dets = read_detections(p_path)
+        tile_dets_map[z] = dets
+        # 映射局部坐标到全局坐标
+        # z=0 -> row=0, col=0
+        # z=1 -> row=1, col=0 (Y increases)
+        # ...
+        # z=ny -> row=0, col=1 (X increases, Y resets)
+        col = z // ny  # X index
+        row = z % ny  # Y index
+        offset_x = col * spacing_x
+        offset_y = row * spacing_y
+
+        for i, d in enumerate(dets):
+            gx = offset_x + d.x
+            gy = offset_y + d.y
+            all_points.append({'global_x': gx, 'global_y': gy, 'conf': d.conf,
+                               'mont_name': montage_name, 'tile_z': z, 'local_idx': i, 'det': d})
+
+    return all_points, tile_dets_map
+
+
+def deduplicate_global_points(all_points: List, box_size: float) -> Tuple[List, Set[Tuple[int, int]]]:
+    """
+    对全局坐标点列表执行碰撞去重逻辑，保留置信度高的点。
+    返回: (最终唯一的高置信度点列表, 被移除点的键集合)
+    """
+    removals = set()  # Set of (tile_z, local_idx) to remove
+    # 预排序：按置信度 (conf) 降序排列，确保高置信度点优先保留
+    all_points.sort(key=lambda p: p['conf'], reverse=True)
+
+    for i in range(len(all_points)):
+        p1 = all_points[i]
+        # If p1 is already marked for removal, it shouldn't suppress others
+        if (p1['tile_z'], p1['local_idx']) in removals:
+            continue
+
+        for j in range(i + 1, len(all_points)):
+            p2 = all_points[j]
+            # If p2 is already removed, skip it
+            if (p2['tile_z'], p2['local_idx']) in removals:
+                continue
+
+            # 使用 check_overlap 检查碰撞；p1 作为中心点，p2 作为检测目标
+            tmp_det = [Detection(cls=0, x=p2['global_x'], y=p2['global_y'], w=box_size, h=box_size, conf=p2['conf'], status="active")]
+            if check_overlap(p1['global_x'], p1['global_y'], box_size, tmp_det):
+                # 因为已排序，p1 的置信度总是大于或等于 p2，所以移除 p2
+                removals.add((p2['tile_z'], p2['local_idx']))
+
+    final_points = [p for p in all_points if (p['tile_z'], p['local_idx']) not in removals]
+    return final_points, removals
+
+def add_predictions_to_nav(input_nav: Path, project_name: str, output_nav: Path, selected_montage_names: List[str], box_size: float) -> str:
+    """Export selected and deduplicated predictions back into a new .nav file."""
+    # 读取 nav 文件并建立 Map lookup: MapFile name -> NavItem
+    items = read_nav_file(str(input_nav))
+    map_lookup = build_map_lookup(items)
+    if not map_lookup:
+        return f"Failed to save: No Map items found in {input_nav}."
+
+    images_dir, preds_dir = ensure_project_dirs(input_nav.parent, project_name)
+    removed_points = 0
+    new_items = []
+    group_id = 1        # GroupID starts from 1 (per-file group), serialEM cannot recognize GroupID = 0
+    tag_id= 1           # set class iterator to continue numbering
+    msg = "."
+    for name in selected_montage_names:
+        map_item = map_lookup.get(name)
         if not map_item:
+            msg = f" {name}" + msg
             continue
 
         try:
+            map_id = map_item.MapID
+            map_frames = map_item.MapFramesXY
             stage_z = map_item.StageXYZ[2]
         except Exception:
+            msg = f" {name}" + msg
             continue
 
-        coords_iter = list(parse_prediction_file(p))
-        if not coords_iter:
-            continue
+        montage_points, tile_dets_map = collect_and_map_points_for_montage(name, map_frames, preds_dir, input_nav.parent)
+        # list of {'global_x', 'global_y', 'conf', 'mont_name', 'tile_z', 'local_idx', 'det'}
+        montage_final_points, removals = deduplicate_global_points(montage_points, box_size)
+        removed_points += len(removals)
 
-        # All NavItems from this file get the same GroupID
-        group_id = group_counter
-        group_counter += 1
-        first = True
-        for (x, y) in coords_iter:
-            d = {
-                'Color': 0, 'NumPts': 0, 'Regis': 1, 'Type': 0,
-                'GroupID': group_id, 'DrawnID': int(map_item.MapID),
-                'CoordsInPiece': [float(x), float(y), float(stage_z)],
-                'PieceOn': int(idx),
-            }
-            # first nav item gets Acquire=1
-            if first:
-                d['Acquire'] = 1
-                first = False
+        grouped_dets = defaultdict(list)
+        # 遍历列表，进行分组
+        for point in montage_final_points:
+            # 提取 tile_z 作为键
+            tile_z = point['tile_z']
+            # 提取 det 对象作为值，并添加到对应键的列表中
+            det_object = point['det']
+            grouped_dets[tile_z].append(det_object)
 
-            # create NavItem (tag will be autogenerated as Item-<number>)
-            nav_item = NavItem(d, f'{project_name}-{tag_id}')
-            new_items.append(nav_item)
-            tag_id += 1
+        # 遍历字典，更新预测文件，并且写入nav_items
+        for tile_z, dets in grouped_dets.items():
+            pred_name = PRED_NAME_TEMPLATE.format(montage=Path(name).stem, z=tile_z)
+            p_path = preds_dir / pred_name
+            write_detections(p_path, dets)
 
-    if tag_id == 1:
-        return f'No active predictions found: {preds_dir}.'
+            # All NavItems from one tile get the same GroupID
+            first = True
+            for d in dets:
+                item = {
+                    'Color': 0, 'NumPts': 0, 'Regis': 1, 'Type': 0,
+                    'GroupID': group_id, 'DrawnID': int(map_id),
+                    'CoordsInPiece': [float(d.x), float(d.y), float(stage_z)], 'PieceOn': int(tile_z),
+                }
+                # first nav item gets Acquire=1
+                if first:
+                    item['Acquire'] = 1
+                    first = False
 
-    # 5) copy input nav to output nav (overwrite if exists)
+                # create NavItem (tag will be autogenerated as Item-<number>)
+                nav_item = NavItem(item, f'{project_name}-{tag_id}')
+                new_items.append(nav_item)
+                tag_id += 1
+            group_id += 1
+
+    # copy input nav to output nav (overwrite if exists)
     shutil.copy2(str(input_nav), str(output_nav))
-
     # Append new items to output nav
     write_nav_file(str(output_nav), *new_items, mode='a')
 
-    return f"Saved nav: {output_nav}. montage items: {len(map_lookup)},  total points: {tag_id - 1}."
+    return (f"Saved to {output_nav}. Totally saved {group_id - 1} groups, {tag_id - 1} points.\n"
+            f"Found {len(map_lookup)} maps in {input_nav}; Selected {len(selected_montage_names)} maps; Deduplicated {removed_points} points. "
+            f"Skipped following montages for reading issue:" + msg)
 
 def build_map_lookup(items) -> Dict[str, NavItem]:
-    """Return dict mapping MapFile stem -> MapItem instance"""
+    """Return dict mapping MapFile name -> MapItem instance"""
     lookup = {}
     for it in items:
-        if getattr(it, 'kind', None) == 'Map':
-            stem = normalize_path(it.MapFile).stem
-            lookup[stem] = it
+        if getattr(it, 'Type', None) == 2:
+            name = normalize_path(it.MapFile).name
+            lookup[name] = it
     return lookup
-
-def parse_prediction_file(fn: Path):
-    """Yield (x, y) for active rows in prediction file."""
-    with fn.open('r') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            parts = line.split()
-            if len(parts) >= 7 and parts[6].lower() == 'active':
-                try:
-                    yield float(parts[1]), float(parts[2])
-                except ValueError:
-                    pass
 
 def append_to_manual_list(project_root: Path, entry: str) -> Optional[str]:
     """Append tile_name to the manual confirmation file."""
