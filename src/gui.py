@@ -31,6 +31,8 @@ import cv2
 import mrcfile
 import numpy as np
 from PyQt5 import QtWidgets, QtGui, QtCore
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from ultralytics import YOLO
@@ -143,27 +145,59 @@ class MontageWatcher(FileSystemEventHandler):
 class YoLoWrapper:
     """Wraps YOLO model interactions."""
 
-    def __init__(self, model_path: str):
-        self.model = YOLO(model_path)
+    def __init__(self, cfg: dict):
+        if cfg["slicing_inference"]:
+            self.model = AutoDetectionModel.from_pretrained(model_type="ultralytics", model_path=str(cfg["model_path"]),
+                                                            confidence_threshold=cfg["conf"], device=cfg["device"])
+        else:
+            self.model = YOLO(cfg["model_path"])
 
     def predict_image(self, img_path: str, cfg: dict) -> Tuple[Optional[List[Detection]], float, float, float]:
-        # cfg keys expected: model_path, img_size, box_size, max_detection, conf, iou, device (either 'cpu' or [GPU index list])
+        # cfg keys expected: model_path, img_size, box_size, max_detection, conf, iou, device (either 'cpu' or [cuda: GPU index])
         dets: List[Detection] = []
         s_pre, s_i, s_post = 0.0, 0.0, 0.0
         try:
-            results = self.model.predict(source=img_path, conf=cfg["conf"], iou=cfg["iou"], imgsz=cfg["img_size"],
-                                         device=cfg["device"], max_det=cfg["max_detection"], save_conf=True, verbose=False)
-            for r in results:
-                for b in r.boxes:
-                    xywh = b.xywh[0].cpu().numpy()  # xywh: tensor([[3094.2964, 3053.0522,  263.7949,  265.7412]])
-                    conf = float(b.conf[0].cpu().numpy())
-                    cls = int(b.cls[0].cpu().numpy())
-                    x, y, w, h = xywh
+            if cfg["slicing_inference"]:
+                # (batch_size, 1, H, W)
+                # directly read picture: Given groups=1, weight of size [64, 1, 3, 3], expected input[1, 3, 1280, 1280] to have 1 channels, but got 3 channels instead
+                # img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)  # (4096, 4096, 1) uint8: 'Cannot handle this data type: (1, 1, 1), |u1'
+                # img_gray = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)  # (4096, 4096, 3) uint8: 'Given groups=1, weight of size [64, 1, 3, 3], expected input[1, 3, 1280, 1280] to have 1 channels, but got 3 channels instead'
+                img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)  # (4096, 4096, 1) uint8: Cannot handle this data type: (1, 1, 1); Image.py line 3308: mode, rawmode = _fromarray_typemap[typekey]
+                img_norm = np.squeeze(img_gray)  # (4096, 4096) uint8: too many indices for array: array is 2-dimensional, but 3 were indexed; ultralytics.py line 85: prediction_result = self.model(image[:, :, ::-1], **kwargs)  # YOLO expects numpy arrays to have BGR
+                # modified ultralytics.py line 85 to:  prediction_result = self.model(image[:, :], **kwargs)  # YOLO does not expect numpy arrays to have BGR
+                results = get_sliced_prediction(img_norm, self.model, slice_height=cfg["img_size"], slice_width=cfg["img_size"], overlap_height_ratio=cfg["overlap"], overlap_width_ratio=cfg["overlap"],)
+                for item in results.to_coco_annotations():
+                    bbox = item['bbox']  # [3770.8741455078125, 230.73524475097656, 143.98486328125, 144.23399353027344]
+                    x0, y0, w, h = bbox
+                    x = x0 + w/2
+                    y = y0 + h/2
                     w, h = float(cfg["box_size"]), float(cfg["box_size"])
+                    cls = int(item['category_id'])
+                    conf = float(item['score'])
                     dets.append(Detection(cls, x, y, w, h, conf, "active"))
-                s_pre = round(r.speed['preprocess'] / 1000, 2)
-                s_i = round(r.speed['inference'] / 1000, 2)
-                s_post= round(r.speed['postprocess'] / 1000, 2)
+                s_pre = round(results.durations_in_seconds['slice'], 2)
+                s_i = round(results.durations_in_seconds['prediction'], 2)
+                s_post = round(results.durations_in_seconds['postprocess'], 2)
+            else:
+                if ':' in cfg["device"]:
+                    device = [int(cfg["device"].split(":")[1])]  # 从'cuda:0' 取 [0]
+                else:
+                    device = cfg["device"]  # cpu
+                # img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)  # cpu/gpu: all fine;
+                # img_gray = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)  # Given groups=1, weight of size [64, 1, 3, 3], expected input[1, 3, 1280, 1280] to have 1 channels, but got 3 channels instead
+                results = self.model.predict(source=img_path, conf=cfg["conf"], iou=cfg["iou"], imgsz=cfg["img_size"],
+                                             device=device, max_det=cfg["max_detection"], save_conf=True, verbose=False)
+                for r in results:
+                    for b in r.boxes:
+                        xywh = b.xywh[0].cpu().numpy()  # xywh: tensor([[3094.2964, 3053.0522,  263.7949,  265.7412]])
+                        conf = float(b.conf[0].cpu().numpy())
+                        cls = int(b.cls[0].cpu().numpy())
+                        x, y, w, h = xywh
+                        w, h = float(cfg["box_size"]), float(cfg["box_size"])
+                        dets.append(Detection(cls, x, y, w, h, conf, "active"))
+                    s_pre = round(r.speed['preprocess'] / 1000, 2)
+                    s_i = round(r.speed['inference'] / 1000, 2)
+                    s_post= round(r.speed['postprocess'] / 1000, 2)
         except Exception as e:
             logger.error(f"Inference error on {img_path}: {e}")
 
@@ -489,7 +523,7 @@ class SettingsPanel(QtWidgets.QWidget):
 
         # Model line with Browse
         self.model_path = QtWidgets.QLineEdit()         # 模型文件路径文本输入框
-        default_model = get_resource_path("data/md2_pm2_best.pt")
+        default_model = get_resource_path("data/md4_pm4_best.pt")
         self.model_path.setText(str(default_model))
         self.model_path_btn = QtWidgets.QPushButton("Browse")
 
@@ -500,46 +534,14 @@ class SettingsPanel(QtWidgets.QWidget):
 
         # Nav line with Browse
         self.nav_path = QtWidgets.QLineEdit()            # 导航文件路径文本输入框
-        default_nav = get_resource_path("test/1211_nav001.nav")         # for test
-        self.nav_path.setText(str(default_nav))
+        # default_nav = get_resource_path("test/1211_nav001.nav")         # for test
+        # self.nav_path.setText(str(default_nav))
         self.nav_path_btn = QtWidgets.QPushButton("Browse")
 
         nav_h = QtWidgets.QHBoxLayout()
         nav_h.addWidget(self.nav_path)
         nav_h.addWidget(self.nav_path_btn)
         layout.addRow("Nav file:", nav_h)
-
-        self.img_size = QtWidgets.QSpinBox()
-        self.img_size.setRange(256, 4096)
-        self.img_size.setValue(2048)
-        layout.addRow("Img size:", self.img_size)
-
-        # micrograph在中倍地图上占据的box_size，如4800X pixel size为26.66 Å，数据收集pixel size为0.9557 Å，
-        # 则有box_size = 4096 / (26.66 / 0.9557) = 147 pixels
-        self.box_size = QtWidgets.QSpinBox()
-        self.box_size.setRange(50, 500)
-        self.box_size.setValue(150)
-        layout.addRow("Box size:", self.box_size)
-
-        # 最大检测数量选择器 - 限制每张图像的最大检测目标数
-        self.max_detection = QtWidgets.QSpinBox()
-        self.max_detection.setRange(1, 400)
-        self.max_detection.setValue(50)
-        layout.addRow("Max detections:", self.max_detection)
-
-        # Confidence (0.0 - 1.0)
-        self.conf = QtWidgets.QDoubleSpinBox()
-        self.conf.setRange(0.0, 1.0)
-        self.conf.setSingleStep(0.01)
-        self.conf.setValue(0.25)
-        layout.addRow("conf:", self.conf)
-
-        # iou (0.0 - 1.0) 较低的数值可以消除重叠的方框，从而减少检测次数，这对减少重复检测非常有用。i.e.数值越大，挑的越多，但会重复。
-        self.iou = QtWidgets.QDoubleSpinBox()
-        self.iou.setRange(0.0, 1.0)
-        self.iou.setSingleStep(0.01)
-        self.iou.setValue(0.7)
-        layout.addRow("iou:", self.iou)
 
         # Device row: label + checkbox（右侧）
         self.device_combo = QtWidgets.QComboBox()
@@ -548,6 +550,66 @@ class SettingsPanel(QtWidgets.QWidget):
             for g in self.gpus:
                 self.device_combo.addItem(f"cuda:{g['id']} ({g['name']}, {g['mem_total']})")
         layout.addRow("Device:", self.device_combo)
+
+        self.slicing_inference = QtWidgets.QCheckBox("SAHI")
+        self.slicing_inference.setChecked(True)
+        self.img_size = QtWidgets.QSpinBox()
+        self.img_size.setRange(256, 4096)
+        self.img_size.setValue(1280)
+
+        # micrograph在中倍地图上占据的box_size，如4800X pixel size为26.66 Å，数据收集pixel size为0.9557 Å，
+        # 则有box_size = 4096 / (26.66 / 0.9557) = 147 pixels
+        self.box_size = QtWidgets.QSpinBox()
+        self.box_size.setRange(50, 500)
+        self.box_size.setValue(150)
+        # Confidence (0.0 - 1.0)
+        self.conf = QtWidgets.QDoubleSpinBox()
+        self.conf.setRange(0.0, 1.0)
+        self.conf.setSingleStep(0.01)
+        self.conf.setValue(0.10)
+        self.conf.setToolTip("Confidence threshold (bigger -> exclude more)")
+
+        necessary_h = QtWidgets.QHBoxLayout()
+        necessary_h.addWidget(self.slicing_inference)
+        necessary_h.addStretch()
+        necessary_h.addWidget(QtWidgets.QLabel("Slice size:"))
+        necessary_h.addWidget(self.img_size)
+        necessary_h.addStretch()
+        necessary_h.addWidget(QtWidgets.QLabel("Box size:"))
+        necessary_h.addWidget(self.box_size)
+        necessary_h.addStretch()
+        necessary_h.addWidget(QtWidgets.QLabel("Conf:"))
+        necessary_h.addWidget(self.conf)
+        layout.addRow(necessary_h)
+
+        # overlap for SAHI
+        self.overlap = QtWidgets.QDoubleSpinBox()
+        self.overlap.setRange(0.0, 0.5)
+        self.overlap.setSingleStep(0.01)
+        self.overlap.setValue(0.2)
+        self.overlap.setToolTip("SAHI slice overlap ratio")
+        # 最大检测数量选择器 - 限制每张图像的最大检测目标数
+        self.max_detection = QtWidgets.QSpinBox()
+        self.max_detection.setRange(1, 400)
+        self.max_detection.setValue(50)
+        self.max_detection.setToolTip("Max detections per tile")
+        # iou (0.0 - 1.0) 较低的数值可以消除重叠的方框，从而减少检测次数，这对减少重复检测非常有用。i.e.数值越大，挑的越多，但会重复。
+        self.iou = QtWidgets.QDoubleSpinBox()
+        self.iou.setRange(0.0, 1.0)
+        self.iou.setSingleStep(0.01)
+        self.iou.setValue(0.7)
+        self.iou.setToolTip("Ultralytics IoU threshold (bigger -> pick more)")
+
+        params_h = QtWidgets.QHBoxLayout()
+        params_h.addWidget(QtWidgets.QLabel("Overlap:"))
+        params_h.addWidget(self.overlap)
+        params_h.addStretch()
+        params_h.addWidget(QtWidgets.QLabel("Max detections:"))
+        params_h.addWidget(self.max_detection)
+        params_h.addStretch()
+        params_h.addWidget(QtWidgets.QLabel("IoU:"))
+        params_h.addWidget(self.iou)
+        layout.addRow(params_h)
 
         self.overwrite = QtWidgets.QCheckBox("Overwrite")
         self.run_btn = QtWidgets.QPushButton("Process Selected")
@@ -564,6 +626,10 @@ class SettingsPanel(QtWidgets.QWidget):
         # 连接按钮事件
         self.model_path_btn.clicked.connect(self.on_browse_model)
         self.nav_path_btn.clicked.connect(self.on_browse_nav)
+        # 当复选框状态改变时，触发 self.on_sahi_toggled
+        self.slicing_inference.toggled.connect(self.on_sahi_toggled)
+        # 初始化状态：根据默认是否勾选，立刻执行一次状态设置
+        self.on_sahi_toggled(self.slicing_inference.isChecked())
         # 当用户用 Browse 选择文件或手工输入并完成（editingFinished）时，触发读取 nav 的逻辑
         self.nav_path.editingFinished.connect(self.on_nav_path_set)
         self.run_btn.clicked.connect(self.on_run)
@@ -579,11 +645,24 @@ class SettingsPanel(QtWidgets.QWidget):
         self.nav_path_btn.setEnabled(enabled)
         self.img_size.setEnabled(enabled)
         self.box_size.setEnabled(enabled)
-        self.max_detection.setEnabled(enabled)
         self.conf.setEnabled(enabled)
+        self.max_detection.setEnabled(enabled)
         self.iou.setEnabled(enabled)
         self.device_combo.setEnabled(enabled)
         self.overwrite.setEnabled(enabled)
+        self.slicing_inference.setEnabled(enabled)
+
+        self.run_btn.setEnabled(enabled)
+        self.stop_btn.setEnabled(not enabled)
+
+        if not enabled:
+            # 运行时，强制禁用这两个参数
+            self.max_detection.setEnabled(False)
+            self.iou.setEnabled(False)
+        else:
+            # 如果是恢复输入状态，需要查看 SAHI 是否勾选
+            is_sahi_on = self.slicing_inference.isChecked()
+            self.on_sahi_toggled(is_sahi_on)
 
     def on_browse_model(self):
         f, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select model file", filter="*.pt *.yaml *.pth")
@@ -596,6 +675,12 @@ class SettingsPanel(QtWidgets.QWidget):
             self.nav_path.setText(f)
             # 立即触发 nav 设置处理（等同于用户完成手工输入）
             self.on_nav_path_set()
+
+    def on_sahi_toggled(self, checked: bool):
+        """槽函数：响应 SAHI 复选框的切换。"""
+        self.max_detection.setEnabled(not checked)
+        self.iou.setEnabled(not checked)
+        self.overlap.setEnabled(checked)
 
     def on_nav_path_set(self):
         """当 nav_path 输入完成（editingFinished 或 Browse 后）调用。仅在文件名以 .nav 结尾且文件存在时发出 nav_changed(Path) 信号。"""
@@ -618,14 +703,15 @@ class SettingsPanel(QtWidgets.QWidget):
             "conf": self.conf.value(),
             "iou": self.iou.value(),
             "overwrite": self.overwrite.isChecked(),
+            "slicing_inference": self.slicing_inference.isChecked(),
+            "overlap": self.overlap.value(),
         }
 
         device_text = self.device_combo.currentText()
         if device_text == "CPU":
             device = "cpu"
         else:
-            name = device_text.split()[0]  # 取"cuda:0"
-            device = [int(name.split(":")[1])]  # 取[0]
+            device = device_text.split()[0]  # 取"cuda:0"
         cfg["device"] = device
 
         if not (cfg["project_name"] and cfg["model_path"] and cfg["nav_path"]):
@@ -643,15 +729,9 @@ class SettingsPanel(QtWidgets.QWidget):
         if cfg:
             # 所有验证通过，发射开始请求信号，携带配置字典
             self.start_requested.emit(cfg)
-            self.run_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
-            self.set_inputs_enabled(False)  # Disable inputs
 
     def on_stop(self):
         self.stop_requested.emit()
-        self.stop_btn.setEnabled(False)
-        self.run_btn.setEnabled(True)
-        self.set_inputs_enabled(True)  # Re-enable inputs
 
     def on_export(self):
         """发射export请求"""
@@ -1424,6 +1504,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.viewer.set_dirs(nav_folder, cfg)
             self.status.set_selection_enabled(False)  # 禁用 UI 交互
+            self.settings.set_inputs_enabled(False)  # 禁用 UI 交互
 
             for m in self.montages.values():
                 if m.name not in self.status.get_checked_montages():
@@ -1431,7 +1512,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.ui_queue.put(("update_montage_status", (m, None)))
 
             # Processing Worker
-            detector = YoLoWrapper(str(cfg["model_path"]))
+            detector = YoLoWrapper(cfg)
             self.worker = MontageProcessor(self.ui_queue, self.job_queue, detector, cfg)
             self.worker.start()  # 启动工作线程，在后台持续监听 job_queue
 
@@ -1449,17 +1530,16 @@ class MainWindow(QtWidgets.QMainWindow):
             msg = f"Processing started. Monitoring directory {nav_folder}..."
             logger.info(msg)
             self.viewer.log(msg)
-
         except Exception as e:
             logger.error(f"Startup failed: {e}")
             QtWidgets.QMessageBox.critical(self, "Error", str(e))
             # If error occurs, re-enable controls
-            self.settings.on_stop()  # Reset settings buttons
-            self.status.set_selection_enabled(True)
+            self.on_stop()
 
     def on_stop(self):
         # Enable controls in Status Panel
         self.status.set_selection_enabled(True)
+        self.settings.set_inputs_enabled(True)
 
         if self.observer:
             self.observer.stop()

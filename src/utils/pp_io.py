@@ -97,6 +97,8 @@ def preview_nav_montages(nav_path: Path) -> Dict[str, Montage]:
             status = "to be shot"
         else:
             continue
+        if normalize_path(mapfile).name in montages.keys() and mapframes == [0, 0]:  # dont let script-defined points override shot maps
+            continue
         mont = Montage(name=normalize_path(mapfile).name, map_id=mapid,
                        map_file=normalize_path(mapfile), map_frames=mapframes, status=status)
         montages[mont.name] = mont
