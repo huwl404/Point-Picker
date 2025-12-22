@@ -28,6 +28,7 @@ The project is structured around the following main GUI panels and background me
      * Communicating with the main GUI thread.
 
 **Core Dependencies:** PyQt5, cv2 (OpenCV), mrcfile, ultralytics (YOLO), watchdog.
+  * Modified line 85 of **.venv/Lib/site-packages/sahi/models/ultralytics.py** from `prediction_result = self.model(image[:, :, ::-1], **kwargs)  # YOLO expects numpy arrays to have BGR` to `prediction_result = self.model(image[:, :], **kwargs)  # YOLO does not expect numpy arrays to have BGR`
 
 ## **🎯 Execution Logic**
 

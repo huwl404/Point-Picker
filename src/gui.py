@@ -48,7 +48,6 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 default_brightness = 100
 
-
 def get_resource_path(relative_path: str) -> Path:
     """兼容 PyInstaller 打包与源码运行"""
     if hasattr(sys, "_MEIPASS"):  # 运行在 PyInstaller 打包环境
@@ -58,6 +57,17 @@ def get_resource_path(relative_path: str) -> Path:
 
     return (base_path / relative_path).resolve()
 
+
+# 定义一个空写入类
+class DummyWriter:
+    def write(self, x): pass
+    def flush(self): pass
+
+# 如果是在打包环境下且没有控制台，处理SAHI的输出
+if sys.stdout is None:
+    sys.stdout = DummyWriter()
+if sys.stderr is None:
+    sys.stderr = DummyWriter()
 
 # -----------------------------
 # Filesystem Watcher
@@ -523,7 +533,7 @@ class SettingsPanel(QtWidgets.QWidget):
 
         # Model line with Browse
         self.model_path = QtWidgets.QLineEdit()         # 模型文件路径文本输入框
-        default_model = get_resource_path("data/md4_pm4_best.pt")
+        default_model = get_resource_path("data/md2_pm2_2048_best.pt")
         self.model_path.setText(str(default_model))
         self.model_path_btn = QtWidgets.QPushButton("Browse")
 
@@ -552,7 +562,7 @@ class SettingsPanel(QtWidgets.QWidget):
         layout.addRow("Device:", self.device_combo)
 
         self.slicing_inference = QtWidgets.QCheckBox("SAHI")
-        self.slicing_inference.setChecked(True)
+        # self.slicing_inference.setChecked(True)
         self.img_size = QtWidgets.QSpinBox()
         self.img_size.setRange(256, 4096)
         self.img_size.setValue(1280)
