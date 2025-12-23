@@ -14,6 +14,7 @@ opencv_python==4.11.0.86  # opencv-python-headless==4.12.0.88 for linux
 pyinstaller==6.16.0
 PyQt5==5.15.3
 pyqt5_sip==12.17.1
+# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 torch==2.8.0+cu126  # torch==2.8.0 for linux
 torchvision==0.23.0  # !!!
 ultralytics==8.3.227  # !!!

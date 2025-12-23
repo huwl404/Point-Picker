@@ -46,7 +46,7 @@ from src.utils.row_reorder_table import RowReorderTable
 
 logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-default_brightness = 100
+default_brightness = 128
 
 def get_resource_path(relative_path: str) -> Path:
     """兼容 PyInstaller 打包与源码运行"""
@@ -565,8 +565,7 @@ class SettingsPanel(QtWidgets.QWidget):
         # self.slicing_inference.setChecked(True)
         self.img_size = QtWidgets.QSpinBox()
         self.img_size.setRange(256, 4096)
-        self.img_size.setValue(1280)
-
+        self.img_size.setValue(2048)
         # micrograph在中倍地图上占据的box_size，如4800X pixel size为26.66 Å，数据收集pixel size为0.9557 Å，
         # 则有box_size = 4096 / (26.66 / 0.9557) = 147 pixels
         self.box_size = QtWidgets.QSpinBox()
@@ -576,7 +575,7 @@ class SettingsPanel(QtWidgets.QWidget):
         self.conf = QtWidgets.QDoubleSpinBox()
         self.conf.setRange(0.0, 1.0)
         self.conf.setSingleStep(0.01)
-        self.conf.setValue(0.10)
+        self.conf.setValue(0.05)
         self.conf.setToolTip("Confidence threshold (bigger -> exclude more)")
 
         necessary_h = QtWidgets.QHBoxLayout()
@@ -911,7 +910,8 @@ class ViewerPanel(QtWidgets.QWidget):
         self._pan_start = None
         self._pan_initial_offset = QtCore.QPoint(0, 0)          # 记录拖动开始时的初始偏移
         self._image_draw_pos: Tuple[int, int, int, int] = (0, 0, 0, 0)  # 记录上次渲染的 image 在 label 上的位置（x, y, w, h） 用于坐标转换
-        self._brightness: float = 1.0                           # 亮度控制（0.0 - 4.0）
+        self._brightness: float = 0.0                           # 亮度偏移 (-128 到 128)
+        self._contrast: float = 1.0                             # 对比度控制（0.5 - 3.0）
         self._auto_brightness_done: bool = False                # 标志位：是否已对当前Tile进行过自动亮度调节
         self.navigation_context = "tile_list"                   # Context Awareness("tile_list" or "manual_list")
 
@@ -927,12 +927,21 @@ class ViewerPanel(QtWidgets.QWidget):
         self.tile_list.itemClicked.connect(self.on_tile_list_clicked)   # 连接切片选择信号
         self.manual_list = QtWidgets.QListWidget()
         self.manual_list.itemClicked.connect(self.on_manual_list_clicked)
-
         left_vbox.addWidget(QtWidgets.QLabel("Tile List"))
         left_vbox.addWidget(self.tile_list)
         left_vbox.addWidget(QtWidgets.QLabel("Manual Confirmation List"))
         left_vbox.addWidget(self.manual_list)
-        left_widget.setMaximumWidth(240)
+        left_widget.setMaximumWidth(320)
+
+        btn_h = QtWidgets.QHBoxLayout()
+        self.group_number_thresh = QtWidgets.QSpinBox()
+        self.group_number_thresh.setRange(1, 99)
+        self.group_number_thresh.setValue(5)
+        self.filter_number_btn = QtWidgets.QPushButton("Add")
+        btn_h.addWidget(QtWidgets.QLabel("Tile with numbers <"))
+        btn_h.addWidget(self.group_number_thresh)
+        btn_h.addWidget(self.filter_number_btn)
+        left_vbox.addLayout(btn_h)
 
         # --- Center Column: Canvas & Basic Controls ---
         center_widget = QtWidgets.QWidget()
@@ -953,12 +962,20 @@ class ViewerPanel(QtWidgets.QWidget):
         row1.addWidget(self.next_btn)
 
         row1.addWidget(QtWidgets.QLabel("Brightness:"))
-        row1.addWidget(QtWidgets.QLabel("40%"))
+        row1.addWidget(QtWidgets.QLabel("-128"))
         self.brightness_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.brightness_slider.setRange(40, 400)
-        self.brightness_slider.setValue(100)
+        self.brightness_slider.setRange(-128, 128)
+        self.brightness_slider.setValue(0)
         row1.addWidget(self.brightness_slider)
-        row1.addWidget(QtWidgets.QLabel("400%"))
+        row1.addWidget(QtWidgets.QLabel("128"))
+
+        row1.addWidget(QtWidgets.QLabel("Contrast:"))
+        row1.addWidget(QtWidgets.QLabel("50%"))
+        self.contrast_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.contrast_slider.setRange(50, 300)
+        self.contrast_slider.setValue(100)
+        row1.addWidget(self.contrast_slider)
+        row1.addWidget(QtWidgets.QLabel("300%"))
 
         row2 = QtWidgets.QHBoxLayout()
         self.spin_filter_conf = QtWidgets.QDoubleSpinBox()
@@ -976,7 +993,6 @@ class ViewerPanel(QtWidgets.QWidget):
         self.delete_btn = QtWidgets.QPushButton("Delete Sel Point")
         self.delete_all_btn = QtWidgets.QPushButton("Delete Curr Tile")
         self.save_btn = QtWidgets.QPushButton("Save")
-
         row2.addWidget(self.delete_btn)
         row2.addWidget(self.delete_all_btn)
         row2.addWidget(self.save_btn)
@@ -995,6 +1011,7 @@ class ViewerPanel(QtWidgets.QWidget):
         layout.addWidget(center_widget, 1)  # Canvas gets most space
 
         self.brightness_slider.valueChanged.connect(self.on_brightness_changed)
+        self.contrast_slider.valueChanged.connect(self.on_contrast_changed)
         self.prev_btn.clicked.connect(self.go_prev)
         self.next_btn.clicked.connect(self.go_next)
         self.delete_btn.clicked.connect(self.delete_selected)
@@ -1002,6 +1019,7 @@ class ViewerPanel(QtWidgets.QWidget):
         self.save_btn.clicked.connect(self.save_and_confirm)
         self.filter_curr_btn.clicked.connect(lambda: self.apply_conf_filter(current_only=True))
         self.filter_all_btn.clicked.connect(lambda: self.apply_conf_filter(current_only=False))
+        self.filter_number_btn.clicked.connect(self.apply_number_filter)
 
     def set_dirs(self, nav_folder: Path, cfg: dict):
         """由 MainWindow 在 on_start 时设置 project 子目录路径"""
@@ -1092,21 +1110,20 @@ class ViewerPanel(QtWidgets.QWidget):
         # Auto Brightness
         if not self._auto_brightness_done:
             mean_val = np.mean(self.base_image)
-            if mean_val > 1:  # Avoid division by zero
-                factor = default_brightness / mean_val
-                # Clamp factor to slider range 0.4 - 4.0
-                factor = max(0.4, min(factor, 4.0))
-                # Update internal brightness and Slider UI
-                self._brightness = factor
-                self.brightness_slider.blockSignals(True)  # Prevent recursive call
-                self.brightness_slider.setValue(int(factor * 100))
-                self.brightness_slider.blockSignals(False)
+            offset = default_brightness - int(mean_val)
+            offset = max(-128, min(offset, 128))
+            self._brightness = offset
+            self.brightness_slider.blockSignals(True)  # Prevent recursive call
+            self.brightness_slider.setValue(offset)
+            self.brightness_slider.blockSignals(False)
             self._auto_brightness_done = True
 
-        # 如果没有修改亮度，直接复用已加载的 pixmap
-        if self._brightness != 1.0:
-            arr = self.base_image.astype(np.float32) * self._brightness
-            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        # 使用 OpenCV 高效处理亮度和对比度
+        # 公式: dst = src * alpha + beta = (src - 128) * self._contrast + 128 + self._brightness
+        if self._brightness != 1.0 or self._contrast != 0:
+            alpha = self._contrast
+            beta = 128 * (1 - self._contrast) + self._brightness
+            arr = cv2.convertScaleAbs(self.base_image, alpha=alpha, beta=beta)
             h, w = arr.shape
             qimg = QtGui.QImage(arr.data, w, h, w, QtGui.QImage.Format_Grayscale8)
             pix = QtGui.QPixmap.fromImage(qimg)
@@ -1154,6 +1171,22 @@ class ViewerPanel(QtWidgets.QWidget):
         self.canvas_label.setPixmap(canvas_pix)             # 把最终画布放到 label（pixmap 大小等于 label 大小）
         self.canvas_label.repaint()                         # 强制重绘
 
+    def on_brightness_changed(self, val: int):
+        """亮度偏移回调"""
+        if self.current_montage is None or self.current_tile_name is None:
+            return
+        self._brightness = val
+        tile = self.current_montage.tiles.get(self.current_tile_name)
+        self._render_tile(tile)
+
+    def on_contrast_changed(self, val: int):
+        """对比度倍数回调"""
+        if self.current_montage is None or self.current_tile_name is None:
+            return
+        self._contrast = val / 100.0
+        tile = self.current_montage.tiles.get(self.current_tile_name)
+        self._render_tile(tile)
+
     def go_prev(self):
         if self.current_montage is None or self.current_tile_name is None:
             return
@@ -1167,7 +1200,6 @@ class ViewerPanel(QtWidgets.QWidget):
             prev_row = (row - 1) % self.tile_list.count()
             self.tile_list.setCurrentRow(prev_row)
             self.on_tile_list_clicked(self.tile_list.currentItem())
-
 
     def go_next(self):
         if self.current_montage is None or self.current_tile_name is None:
@@ -1196,14 +1228,6 @@ class ViewerPanel(QtWidgets.QWidget):
                 if it_text == query_text:
                     self.manual_list.setCurrentRow(i)
                     break
-
-    def on_brightness_changed(self, val: int):
-        """slider 回调：val 0-400 映射到 0.0-4.0"""
-        if self.current_montage is None or self.current_tile_name is None:
-            return
-        self._brightness = val / 100.0
-        tile = self.current_montage.tiles.get(self.current_tile_name)
-        self._render_tile(tile)
 
     def delete_selected(self):
         if self.selected_det is None or self.current_montage is None or self.current_tile_name is None:
@@ -1273,6 +1297,27 @@ class ViewerPanel(QtWidgets.QWidget):
         self.log(msg)
         logger.info(msg)
         self.set_current_tile(self.current_tile_name)
+
+    def apply_number_filter(self):
+        if self.current_montage is None or self.current_tile_name is None:
+            return
+        thresh = self.group_number_thresh.value()
+        existing_items = read_manual_list(self.project_root)
+        added_num = 0
+        for p in sorted(self.preds_dir.glob("*.txt")):
+            mont, idx = match_name(p.name, _PRED_RE)
+            if idx > -1:
+                dets = read_detections(p)
+                actie_dets = [d for d in dets if d.status == "active"]
+                tp = str(p.with_suffix(".png").name)
+                if len(actie_dets) < thresh and tp not in existing_items:
+                    append_to_manual_list(self.project_root, tp)
+                    added_num += 1
+
+        msg = f"For all available files: Added {added_num} groups with point numbers < {thresh} to manual list. "
+        self.log(msg)
+        logger.info(msg)
+        self.refresh_manual_list()
 
     def save_and_confirm(self):
         if self.current_montage is None or self.current_tile_name is None:
@@ -1519,7 +1564,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for m in self.montages.values():
                 if m.name not in self.status.get_checked_montages():
                     m.status = "excluded"
-                    self.ui_queue.put(("update_montage_status", (m, None)))
+                    # self.ui_queue.put(("update_montage_status", (m, None)))
 
             # Processing Worker
             detector = YoLoWrapper(cfg)
