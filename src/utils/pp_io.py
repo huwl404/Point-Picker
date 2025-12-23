@@ -123,6 +123,26 @@ def load_nav_and_montages(nav_path: Path, project_name: str, overwrite: bool) ->
             os.remove(p)
     return montages
 
+def update_montages_if_map_notfound(nav_path: Path, montages: Dict[str, Montage]) -> str:
+    items = read_nav_file(str(nav_path))
+    for it in items:
+        try:
+            if getattr(it, "Type", None) != 2:
+                continue
+
+            mapfile_raw = getattr(it, "MapFile")
+            mapfile_norm = normalize_path(mapfile_raw)
+            if mapfile_norm.name not in montages.keys():
+                map_file = nav_path.parent / mapfile_norm.name
+                map_id = getattr(it, "MapID")
+                map_frames = getattr(it, "MapFramesXY")
+                mont = Montage(name=map_file.name, map_id=map_id, map_file=map_file, map_frames=map_frames)
+                montages[mont.name] = mont
+                return "Updated"
+        except Exception as e:
+            return str(e)
+    return "Not Found."
+
 def update_montage_if_map_generated(nav_path: Path, mont: Montage) -> str:
     """
     重新读取 nav_path，查找是否存在 Type==2 且 MapFile 对应 mont.map_file 的条目。
@@ -139,7 +159,7 @@ def update_montage_if_map_generated(nav_path: Path, mont: Montage) -> str:
             if mapfile_norm.name != mont.name:
                 continue
             # 找到匹配项 -> 更新 montage 字段
-            mont.map_file = mapfile_norm
+            mont.map_file = nav_path.parent / mapfile_norm.name
             mont.map_id = getattr(it, "MapID", mont.map_id)
             mont.map_frames = getattr(it, "MapFramesXY", mont.map_frames)
             return "Updated"

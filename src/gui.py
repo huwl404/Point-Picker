@@ -41,7 +41,7 @@ from src.utils.data_models import Montage, Tile, Detection, STATUS_COLORS
 from src.utils.pp_io import load_nav_and_montages, ensure_project_dirs, write_detections, read_detections, \
     add_predictions_to_nav, TILE_NAME_TEMPLATE, PRED_NAME_TEMPLATE, append_to_manual_list, read_manual_list, match_name, \
     _TILE_RE, remove_from_manual_list, _PRED_RE, update_montage_if_map_generated, check_overlap, \
-    collect_and_map_points_for_montage, deduplicate_global_points, preview_nav_montages
+    collect_and_map_points_for_montage, deduplicate_global_points, preview_nav_montages, update_montages_if_map_notfound
 from src.utils.row_reorder_table import RowReorderTable
 
 logger = logging.getLogger(__name__)
@@ -111,7 +111,12 @@ class MontageWatcher(FileSystemEventHandler):
         """处理稳定的montage文件"""
         mont = self.montages.get(file_path.name)
         if not mont:
-            return
+            info = update_montages_if_map_notfound(self.nav_path, self.montages)
+            if info == "Updated":
+                mont = self.montages.get(file_path.name)
+            else:
+                logger.error(f"Updated {file_path.name} failed: {info}")
+                return
 
         if mont.status == "to be validated":
             mont.status = "queuing"
@@ -145,7 +150,7 @@ class MontageWatcher(FileSystemEventHandler):
     def on_modified(self, event):
         # 对于大文件，修改事件可能在写入过程中多次触发
         p = Path(event.src_path).resolve()
-        if p not in self.processed_files and self._is_file_stable(p, check_interval=10.0):    # 对于修改事件，使用更长的检查间隔
+        if p not in self.processed_files and self._is_file_stable(p, check_interval=16.0):    # 对于修改事件，使用更长的检查间隔
             self._process_mrc_file(p)
 
 
@@ -776,8 +781,8 @@ class StatusPanel(QtWidgets.QWidget):
         self.table_widget = RowReorderTable(0, 3)
         self.table_widget.setHorizontalHeaderLabels(["Montage Name", "Status", "Selected"])
         self.table_widget.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)  # 第一列拉伸
-        self.table_widget.setColumnWidth(1, 160)
-        self.table_widget.setColumnWidth(2, 80)
+        self.table_widget.setColumnWidth(1, 120)
+        self.table_widget.setColumnWidth(2, 60)
         self.table_widget.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)  # 整行选择
         self.table_widget.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)  # 只能选一行
         self.table_widget.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)   # 不可编辑
@@ -1299,8 +1304,6 @@ class ViewerPanel(QtWidgets.QWidget):
         self.set_current_tile(self.current_tile_name)
 
     def apply_number_filter(self):
-        if self.current_montage is None or self.current_tile_name is None:
-            return
         thresh = self.group_number_thresh.value()
         existing_items = read_manual_list(self.project_root)
         added_num = 0
@@ -1308,13 +1311,15 @@ class ViewerPanel(QtWidgets.QWidget):
             mont, idx = match_name(p.name, _PRED_RE)
             if idx > -1:
                 dets = read_detections(p)
-                actie_dets = [d for d in dets if d.status == "active"]
+                active_dets = [d for d in dets if d.status == "active"]
+                if len(active_dets) == 0:
+                    continue
                 tp = str(p.with_suffix(".png").name)
-                if len(actie_dets) < thresh and tp not in existing_items:
+                if len(active_dets) < thresh and tp not in existing_items:
                     append_to_manual_list(self.project_root, tp)
                     added_num += 1
 
-        msg = f"For all available files: Added {added_num} groups with point numbers < {thresh} to manual list. "
+        msg = f"For all files to be collected: Added {added_num} groups with point numbers < {thresh} to manual list. "
         self.log(msg)
         logger.info(msg)
         self.refresh_manual_list()
