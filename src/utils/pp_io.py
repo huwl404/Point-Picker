@@ -205,6 +205,7 @@ def write_detections(path: Path, dets: List[Detection]):
             fh.write(f"{d.cls} {d.x:.2f} {d.y:.2f} {d.w:.2f} {d.h:.2f} {d.conf:.2f} {d.status}\n")
 
 def check_overlap(cx: float, cy: float, size: float, dets: List[Detection]) -> bool:
+    size *= 1.4
     r1_x1, r1_y1 = cx - size / 2, cy - size / 2  # 左上角
     r1_x2, r1_y2 = cx + size / 2, cy + size / 2  # 右下角
 

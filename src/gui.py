@@ -301,7 +301,8 @@ class MontageProcessor(QtCore.QThread):
                             # center_det = self._find_center_point(img_norm, dets)  # TOO BAD
                             # center_det = self._find_center_point_kmeans(img_norm, dets)  # 15/31 -> 12/32
                             # center_det = self._find_center_point_dbscan(img_norm, dets)  # TOO SLOW
-                            center_det = self._find_center_point_fft(img_norm, dets)  # FASTEST 6/32 -> 7/32 -> 9/32 -> 10/32 -> 8/32 -> 8/32 -> 6/32 -> 8/32
+                            # center_det = self._find_center_point_fft(img_norm, dets)  # FASTEST 6/32 -> 7/32 -> 9/32 -> 10/32 -> 8/32 -> 8/32 -> 6/32 -> 8/32
+                            center_det = self._find_center_point_fast(img_norm, dets)  # 31/32
                             if center_det:  # Add to front of list
                                 dets.insert(0, center_det)
                             else:  # Not found: Signal UI to add to manual list
@@ -328,130 +329,51 @@ class MontageProcessor(QtCore.QThread):
             logger.error(f"Error reading MRC {montage.map_file}: {e}")
             raise e
 
-    def _find_center_point_fft(self, img: np.ndarray, existing_dets: List[Detection]) -> Optional[Detection]:
+    def _find_center_point_fast(self, img: np.ndarray, existing_dets: List[Detection]) -> Optional[Detection]:
         """
-        Identify Carbon areas using FFT High-Pass Filtering.
-        Carbon has texture (medium high-freq energy), Holes are smooth (low energy), Edges are sharp (very high energy).
+        极速且鲁棒的探测法：寻找能容纳下 box_size 的纯净区域。
         """
         h, w = img.shape
         box_size = self.cfg["box_size"]
 
-        # 1. Downsample for speed (Processing at 512px is sufficient for texture analysis)
+        # 1. 降采样以提升速度 (处理 512 或 1024 足够)
         scale_factor = 512.0 / max(h, w)
-        if scale_factor < 1.0:
-            small_img = cv2.resize(img, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
-        else:
-            small_img = img.copy()
-            scale_factor = 1.0
-
-        sh, sw = small_img.shape
-        small_img = cv2.normalize(small_img, None, 0, 255, cv2.NORM_MINMAX)
-        # 2. FFT High Pass Filter to extract "Structure/Texture" map
-        f = np.fft.fft2(small_img.astype(np.float32))
-        fshift = np.fft.fftshift(f)
-        # Mask out center (Low Frequencies) - removing illumination/gradients
-        crow, ccol = sh // 2, sw // 2
-        # Mask radius: ~2% of image size is usually enough to remove "flat" components
-        mask_rad = int(min(sh, sw) * 0.02)
-        fshift[crow - mask_rad:crow + mask_rad, ccol - mask_rad:ccol + mask_rad] = 0
-        # Inverse FFT to get structure image
-        f_ishift = np.fft.ifftshift(fshift)
-        img_back = np.fft.ifft2(f_ishift)
-        img_back = np.abs(img_back)
-
-        # 3. Analyze Texture Energy
-        # Smooth the structure map to get regional texture estimates
-        texture_map = cv2.GaussianBlur(img_back, (9, 9), 0)
-        # Normalize to 0-255 for thresholding
-        texture_map = cv2.normalize(texture_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-        # 4. Thresholding to find "Carbon"
-        # - Low Texture (< T1) -> Holes / Flat Ice (Too smooth)
-        # - High Texture (> T2) -> Edges / Grid Bars / Contaminants (Too sharp)
-        # - Medium Texture -> Carbon
-        # Dynamic Thresholding based on image statistics is more robust than fixed values
-        mean_val = np.mean(texture_map)
-        std_val = np.std(texture_map)
-        # Carbon typically lies around the mean noise level
-        # Holes are significantly below mean; Edges are significantly above.
-        lower_thresh = mean_val - 0.5 * std_val  # Cut off very smooth areas
-        upper_thresh = mean_val + 2.0 * std_val  # Cut off strong edges
-        # Create Binary Mask
-        # lower < texture < upper)
-        texture_mask = cv2.inRange(texture_map, lower_thresh, upper_thresh)
-
-        # 5. Clean up Mask
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        texture_mask = cv2.morphologyEx(texture_mask, cv2.MORPH_OPEN, kernel)  # Remove noise specks
-        texture_mask = cv2.erode(texture_mask, kernel, iterations=2)  # Shrink away from edges
-        intensity_mask = cv2.inRange(small_img, 25, 200)
-        masked_by_intensity = cv2.bitwise_and(texture_mask, intensity_mask)
-
-        # 6. Apply Central 1/4 ROI Constraint
-        roi_mask = np.zeros_like(masked_by_intensity)
-        roi_x1, roi_x2 = int(sw * 0.25), int(sw * 0.75)
-        roi_y1, roi_y2 = int(sh * 0.25), int(sh * 0.75)
-        roi_mask[roi_y1:roi_y2, roi_x1:roi_x2] = 255
-        # Combine Carbon Mask and ROI
-        final_mask = cv2.bitwise_and(masked_by_intensity, roi_mask)
-        if cv2.countNonZero(final_mask) == 0:
-            logger.warning(f"FFT: No valid carbon area found in center.")
+        small_img = cv2.resize(img, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
+        # 2. 建立“安全亮度”掩模
+        mask = cv2.inRange(small_img, 36, 240)
+        # 3. 核心：形态学腐蚀 这一步相当于用一个 box 尺寸的窗口去“探测”哪里能放得下
+        k_size = max(int(box_size * scale_factor), 8)
+        kernel = np.ones((k_size, k_size), np.uint8)
+        # 腐蚀后，剩下的所有像素点，只要选它作为中心，整个 box 范围就一定都在 mask 内
+        safe_zone = cv2.erode(mask, kernel, iterations=1)
+        # 4. ROI 限制：只在图像中心 50% 区域寻找，避免贴边太近
+        sh, sw = safe_zone.shape
+        roi_mask = np.zeros_like(safe_zone)
+        margin_w, margin_h = int(sw * 0.25), int(sh * 0.25)
+        roi_mask[margin_h: sh - margin_h, margin_w: sw - margin_w] = 255
+        final_candidates_mask = cv2.bitwise_and(safe_zone, roi_mask)
+        # 5. 寻找候选点
+        coords = np.column_stack(np.where(final_candidates_mask > 0))
+        if len(coords) == 0:
             return None
 
-        # 7. Distance Transform to find the "deepest" point inside the valid carbon area
-        dist_transform = cv2.distanceTransform(final_mask, cv2.DIST_L2, 5)
-        # Add a bias towards image center
-        center_x_small, center_y_small = sw // 2, sh // 2
-        y_grid, x_grid = np.indices((sh, sw))
-        # Distance from image center (normalized)
-        dist_from_center = np.sqrt((x_grid - center_x_small) ** 2 + (y_grid - center_y_small) ** 2)
-        max_dist_center = np.sqrt(center_x_small ** 2 + center_y_small ** 2)
-        # Centrality Score: 1.0 at center, 0.0 at corners
-        centrality_map = 1.0 - (dist_from_center / max_dist_center)
-        # Final Score = Safety (Distance from edges) * Weight + Centrality * Weight
-        # We value Safety more than Centrality to avoid edges
-        score_map = dist_transform + (centrality_map * (box_size * scale_factor * 0.2))
-
-        # Get candidates
-        # Only look at points with valid distance > buffer (2 pixels in small_img)
-        # Must be within final_mask to ensure texture and intensity constraints are met
-        ys, xs = np.nonzero(cv2.bitwise_and(final_mask, (dist_transform > 2.0).astype(np.uint8)))
-        if len(xs) == 0:
-            return None
-
+        mean_img = cv2.blur(small_img.astype(np.float32), (k_size, k_size))
+        # 获取所有安全点的亮度分值
         candidates = []
-        for x, y in zip(xs, ys):
-            score = score_map[y, x]
-            candidates.append((score, x, y))
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-
-        # 8. Check Overlap
-        final_cx, final_cy = None, None
-        for _, cx_small, cy_small in candidates[:50]:
-            cx_orig = cx_small / scale_factor
-            cy_orig = cy_small / scale_factor
-            if not check_overlap(cx_orig, cy_orig, box_size * 4, existing_dets):
-                half_box = int(box_size * scale_factor // 2)
-                x1 = max(0, int(cx_small) - half_box)
-                y1 = max(0, int(cy_small) - half_box)
-                x2 = min(w, int(cx_small) + half_box)
-                y2 = min(h, int(cy_small) + half_box)
-                # Extract the candidate box from original image
-                candidate_box = small_img[y1:y2, x1:x2]
-                # Check if box contains very bright pixels (holes)
-                # Using a threshold close to 255 to detect holes
-                bright_pixels = np.sum(candidate_box > 200)
-                # If too many bright pixels are found, skip this candidate (it has holes)
-                max_allowed_bright_pixels = candidate_box.size * 0.01  # Allow up to 1% bright pixels
-                if bright_pixels > max_allowed_bright_pixels:
-                    continue  # Skip this candidate, it has holes
-
-                final_cx, final_cy = cx_orig, cy_orig
+        for r, c in coords:
+            score = mean_img[r, c]  # 这里的亮度代表了整个候选框的平均亮度
+            candidates.append((score, r, c))
+        # 按亮度升序排序（最暗的在前）
+        candidates.sort(key=lambda x: x[0])
+        count = 0
+        for score, r_small, c_small in candidates:
+            if count >= 50:
                 break
-
-        if final_cx is not None:
-            return Detection(cls=0, x=final_cx, y=final_cy, w=float(box_size), h=float(box_size), conf=2.0, status="active")
+            cx_orig = c_small / scale_factor
+            cy_orig = r_small / scale_factor
+            if not check_overlap(cx_orig, cy_orig, box_size, existing_dets):
+                return Detection(cls=0, x=cx_orig, y=cy_orig, w=float(box_size), h=float(box_size), conf=2.0, status="active")
+            count += 1
 
         return None
 
@@ -528,7 +450,7 @@ class SettingsPanel(QtWidgets.QWidget):
         return gpus
 
     def _build_ui(self):
-        """UI构建: project_name, model_path, nav_path, box_size, max_detection, conf, iou, device_combo"""
+        """UI构建"""
         # 使用表单布局管理器 - 适合标签-字段对的排列
         layout = QtWidgets.QFormLayout(self)
 
@@ -576,6 +498,9 @@ class SettingsPanel(QtWidgets.QWidget):
         self.box_size = QtWidgets.QSpinBox()
         self.box_size.setRange(50, 500)
         self.box_size.setValue(150)
+        self.box_size.setToolTip("High-mag micrograph box size in pixels on medium-mag maps.\n"
+                                 "e.g. The pixel size of maps collected on 4800X mag is 26.66 Å, that of 4096*4096 micrograph on 130kX mag is 0.9557 Å.\n"
+                                 "Then box size should be 4096 / (26.66 / 0.9557) = 147 pixels, and illumina area is assumed to be 2X box size to eliminate overlapping spots.")
         # Confidence (0.0 - 1.0)
         self.conf = QtWidgets.QDoubleSpinBox()
         self.conf.setRange(0.0, 1.0)
@@ -1161,6 +1086,10 @@ class ViewerPanel(QtWidgets.QWidget):
                 y0 = int((det.y - det.h / 2) * self.display_scale) + y  # 左上角y坐标
                 w = int(det.w * self.display_scale)
                 h = int(det.h * self.display_scale)
+                # x0 = int((det.x - self.box_size / 2) * self.display_scale) + x  # 左上角x坐标
+                # y0 = int((det.y - self.box_size / 2) * self.display_scale) + y  # 左上角y坐标
+                # w = int(self.box_size * self.display_scale)
+                # h = int(self.box_size * self.display_scale)
 
                 color_name = STATUS_COLORS.get("active")
                 if self.selected_det and det == self.selected_det:
@@ -1304,6 +1233,8 @@ class ViewerPanel(QtWidgets.QWidget):
         self.set_current_tile(self.current_tile_name)
 
     def apply_number_filter(self):
+        if not self.project_root:
+            return
         thresh = self.group_number_thresh.value()
         existing_items = read_manual_list(self.project_root)
         added_num = 0
