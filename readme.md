@@ -1,7 +1,7 @@
 # **Point-Picker: SerialEM Annotation Tool**
 
 Point-Picker is a Graphical User Interface (GUI) tool built with Python and PyQt5, designed for the Cryo-EM field. It monitors the navigator file and montage outputs produced by the SerialEM software, automates YOLO object detection inference, and provides an interactive interface for users to inspect, edit, and export collected coordinate information, ultimately generating navigation files compatible with the SerialEM format.
-> ![img.png](data/img_win11_v0.3.png)
+> ![img.png](data/img_win11_v0.4.png)
 > *Screenshot of Point-Picker Running on Win11*
 > ![img.png](data/img_linux.png)
 > *Screenshot of Point-Picker Running on Linux*

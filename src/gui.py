@@ -194,19 +194,17 @@ class YoLoWrapper:
                 s_i = round(results.durations_in_seconds['prediction'], 2)
                 s_post = round(results.durations_in_seconds['postprocess'], 2)
             else:
-                if ':' in cfg["device"]:
-                    device = [int(cfg["device"].split(":")[1])]  # 从'cuda:0' 取 [0]
-                else:
-                    device = cfg["device"]  # cpu
                 # img_gray = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)  # cpu/gpu: all fine;
                 # img_gray = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)  # Given groups=1, weight of size [64, 1, 3, 3], expected input[1, 3, 1280, 1280] to have 1 channels, but got 3 channels instead
                 results = self.model.predict(source=img_path, conf=cfg["conf"], iou=cfg["iou"], imgsz=cfg["img_size"],
-                                             device=device, max_det=cfg["max_detection"], save_conf=True, verbose=False)
+                                             device=cfg["device"], half=True, max_det=cfg["max_detection"], save_conf=True, verbose=False)
                 for r in results:
                     for b in r.boxes:
+                        cls = int(b.cls[0].cpu().numpy())
+                        if cls != 0:  # Make sure class 0 is targets
+                            continue
                         xywh = b.xywh[0].cpu().numpy()  # xywh: tensor([[3094.2964, 3053.0522,  263.7949,  265.7412]])
                         conf = float(b.conf[0].cpu().numpy())
-                        cls = int(b.cls[0].cpu().numpy())
                         x, y, w, h = xywh
                         w, h = float(cfg["box_size"]), float(cfg["box_size"])
                         dets.append(Detection(cls, x, y, w, h, conf, "active"))
@@ -460,7 +458,7 @@ class SettingsPanel(QtWidgets.QWidget):
 
         # Model line with Browse
         self.model_path = QtWidgets.QLineEdit()         # 模型文件路径文本输入框
-        default_model = get_resource_path("data/md2_pm2_2048_best.pt")
+        default_model = get_resource_path("data/11n2clspm2_4096_0.53P_0.67R_best.pt")
         self.model_path.setText(str(default_model))
         self.model_path_btn = QtWidgets.QPushButton("Browse")
 
@@ -492,7 +490,7 @@ class SettingsPanel(QtWidgets.QWidget):
         # self.slicing_inference.setChecked(True)
         self.img_size = QtWidgets.QSpinBox()
         self.img_size.setRange(256, 4096)
-        self.img_size.setValue(2048)
+        self.img_size.setValue(4096)
         # micrograph在中倍地图上占据的box_size，如4800X pixel size为26.66 Å，数据收集pixel size为0.9557 Å，
         # 则有box_size = 4096 / (26.66 / 0.9557) = 147 pixels
         self.box_size = QtWidgets.QSpinBox()
