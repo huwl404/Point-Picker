@@ -29,6 +29,8 @@ The project is structured around the following main GUI panels and background me
 
 **Core Dependencies:** PyQt5, cv2 (OpenCV), mrcfile, ultralytics (YOLO), watchdog.
   * Modified line 85 of **.venv/Lib/site-packages/sahi/models/ultralytics.py** from `prediction_result = self.model(image[:, :, ::-1], **kwargs)  # YOLO expects numpy arrays to have BGR` to `prediction_result = self.model(image[:, :], **kwargs)  # YOLO does not expect numpy arrays to have BGR`
+  * For now, this tool only record targets with class 0, see line 204 of **gui.py**.
+  * To handle the fact that illumina area is around 2X camera field of vision, box size is multiplied by 1.4, see line 208 of **pp_io.py**. 
 
 ## **🎯 Execution Logic**
 
